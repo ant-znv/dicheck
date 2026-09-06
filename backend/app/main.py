@@ -181,6 +181,92 @@ _FENCED_RE = re.compile(r"```[ \t]*(\w*)[ \t]*\r?\n(.*?)```", re.DOTALL)
 _EDIT_KEYS = ("id", "title", "original", "replacement", "reason")
 _VALID_VERDICTS = {"ok", "risk", "fail"}
 
+# ---------- Починка markdown-таблиц в отчёте ----------
+# Модель иногда выдаёт таблицу проверок, склеенную в одну строку/блок —
+# рендерер показывает её сплошным текстом (см. docs/api-contract.md).
+
+_DELIM_CELL_RE = re.compile(r":?-{3,}:?")
+
+
+def _table_cells(line: str) -> list[str] | None:
+    """Ячейки таблицной строки (обязательны leading/trailing '|'), иначе None."""
+    s = line.strip()
+    if not s.startswith("|") or not s.endswith("|") or s.count("|") < 2:
+        return None
+    return [c.strip() for c in s[1:-1].split("|")]
+
+
+def _rebuild_table_block(lines: list[str]) -> list[str] | None:
+    """Разбивает склеенные ряды таблицного блока на отдельные строки.
+
+    Ячейки всех строк блока складываются в один поток, ищется серия
+    разделительных ячеек '---' (она задаёт число колонок), шапка и данные
+    нарезаются заново. Возвращает None, если блок нельзя разобрать однозначно
+    (нет разделителя, шапка не равна числу колонок, данные не кратны) —
+    тогда исходный текст оставляется как есть. Пустые ячейки/разделители
+    рядов в потоке неразличимы, поэтому выбрасываются: таблицы с пустыми
+    ячейками обычно не проходят проверку кратности и не трогаются.
+    """
+    stream: list[str] = []
+    for line in lines:
+        stream.extend(c for c in (_table_cells(line) or []) if c)
+
+    run_start = run_end = None
+    i = 0
+    while i < len(stream):
+        if _DELIM_CELL_RE.fullmatch(stream[i]):
+            j = i
+            while j < len(stream) and _DELIM_CELL_RE.fullmatch(stream[j]):
+                j += 1
+            if run_start is not None:  # вторая серия '---' — неоднозначно
+                return None
+            run_start, run_end = i, j
+            i = j
+        else:
+            i += 1
+    if run_start is None or run_start == 0:
+        return None
+    col = run_end - run_start
+    header = stream[:run_start]
+    data = stream[run_end:]
+    if len(header) != col or not data or len(data) % col != 0:
+        return None
+
+    out = ["| " + " | ".join(header) + " |"]
+    out.append("| " + " | ".join(stream[run_start:run_end]) + " |")
+    for r in range(0, len(data), col):
+        row = data[r : r + col]
+        if not any(row):
+            return None
+        out.append("| " + " | ".join(row) + " |")
+    return out
+
+
+def _repair_markdown_tables(report: str) -> str:
+    """Чинит таблицы, склеенные моделью в одну строку или подряд идущие строки.
+
+    Корректно размеченные таблицы проходят через пересборку без изменений
+    (идемпотентно); неоднозначные блоки не трогаются вовсе.
+    """
+    out: list[str] = []
+    block: list[str] = []
+
+    def flush() -> None:
+        if not block:
+            return
+        rebuilt = _rebuild_table_block(block)
+        out.extend(rebuilt if rebuilt is not None else block)
+        block.clear()
+
+    for line in report.split("\n"):
+        if _table_cells(line) is not None:
+            block.append(line)
+        else:
+            flush()
+            out.append(line)
+    flush()
+    return "\n".join(out)
+
 
 def _normalize_edits(data: object) -> list[dict] | None:
     """Валидирует распарсенный JSON и приводит edits к списку dict'ов по контракту."""
@@ -311,6 +397,7 @@ async def _check_file(
                 user_message,
             )
             report, edits, verdict = _parse_edits(raw_report)
+            report = _repair_markdown_tables(report)
             result["report"] = report
             result["edits"] = edits
             result["summaryVerdict"] = verdict or _summary_verdict(report)
@@ -511,6 +598,32 @@ def _clean_md_inline(text: str) -> str:
     return text.replace("**", "").replace("__", "").replace("`", "").strip()
 
 
+def _parse_table_block(
+    lines: list[str], start: int
+) -> tuple[list[list[str]], int] | None:
+    """GFM-таблица с позиции start: [(строки ячеек), индекс после таблицы] или None.
+
+    Таблица = строка-шапка, за которой сразу идёт строка-разделитель '---'.
+    """
+    if start + 1 >= len(lines):
+        return None
+    header = _table_cells(lines[start])
+    if not header:
+        return None
+    delim = _table_cells(lines[start + 1])
+    if not delim or not all(_DELIM_CELL_RE.fullmatch(c) for c in delim):
+        return None
+    rows = [header]
+    i = start + 2
+    while i < len(lines):
+        cells = _table_cells(lines[i])
+        if not cells:
+            break
+        rows.append(cells)
+        i += 1
+    return rows, i
+
+
 def _markdown_into_docx(doc: Document, text: str) -> None:
     """Добавляет markdown-подобный текст модели в существующий Document."""
     lines = text.strip().splitlines()
@@ -520,10 +633,29 @@ def _markdown_into_docx(doc: Document, text: str) -> None:
     if lines and lines[-1].strip() == "```":
         lines = lines[:-1]
 
-    for raw_line in lines:
-        line = raw_line.rstrip()
-        if not line.strip():
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        table = _parse_table_block(lines, i)
+        if table:
+            rows, i = table
+            ncols = len(rows[0])
+            docx_table = doc.add_table(rows=0, cols=ncols)
+            docx_table.style = "Table Grid"
+            for r, row in enumerate(rows):
+                cells = docx_table.add_row().cells
+                for c in range(ncols):
+                    cell = cells[c]
+                    cell.text = _clean_md_inline(row[c] if c < len(row) else "")
+                    if r == 0:  # шапка — полужирным
+                        for par in cell.paragraphs:
+                            for run in par.runs:
+                                run.bold = True
             continue
+        if not line.strip():
+            i += 1
+            continue
+        line = line.rstrip()
         if line.startswith("### "):
             doc.add_heading(_clean_md_inline(line[4:]), level=3)
         elif line.startswith("## "):
@@ -538,6 +670,7 @@ def _markdown_into_docx(doc: Document, text: str) -> None:
             doc.add_paragraph(_clean_md_inline(item), style="List Number")
         else:
             doc.add_paragraph(_clean_md_inline(line))
+        i += 1
 
 
 def _markdown_to_docx(text: str) -> bytes:
