@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-zinc-950 text-zinc-100 antialiased;
+}
+
+/* Стили отрендеренного markdown-отчёта */
+.md-report {
+  @apply text-sm leading-relaxed text-zinc-200;
+}
+.md-report h1 {
+  @apply mt-6 mb-3 text-xl font-semibold text-zinc-50 first:mt-0;
+}
+.md-report h2 {
+  @apply mt-5 mb-2 text-lg font-semibold text-zinc-50;
+}
+.md-report h3 {
+  @apply mt-4 mb-2 text-base font-semibold text-zinc-100;
+}
+.md-report h4 {
+  @apply mt-3 mb-1 text-sm font-semibold text-zinc-100;
+}
+.md-report p {
+  @apply my-2;
+}
+.md-report ul {
+  @apply my-2 list-disc pl-6;
+}
+.md-report ol {
+  @apply my-2 list-decimal pl-6;
+}
+.md-report li {
+  @apply my-1;
+}
+.md-report a {
+  @apply text-sky-400 underline underline-offset-2 hover:text-sky-300;
+}
+.md-report strong {
+  @apply font-semibold text-zinc-50;
+}
+.md-report blockquote {
+  @apply my-3 border-l-2 border-zinc-600 pl-4 text-zinc-400;
+}
+.md-report code {
+  @apply rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[0.85em] text-amber-200;
+}
+.md-report pre {
+  @apply my-3 overflow-x-auto rounded-lg bg-zinc-900 p-3;
+}
+.md-report pre code {
+  @apply bg-transparent p-0 text-zinc-200;
+}
+.md-report hr {
+  @apply my-4 border-zinc-700;
+}
+.md-report table {
+  @apply my-3 w-full border-collapse text-left text-sm;
+}
+.md-report th {
+  @apply border border-zinc-700 bg-zinc-800/70 px-3 py-2 font-semibold text-zinc-100;
+}
+.md-report td {
+  @apply border border-zinc-700 px-3 py-2 align-top;
+}
+.md-report tr:nth-child(even) td {
+  @apply bg-zinc-900/60;
+}
