@@ -79,8 +79,14 @@ Body: `{ "resultIndex": 0, "editIds": ["e1", "e3"] }` — применить в�
 Ответ: 200, `Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `Content-Disposition: attachment; filename="<имя>_исправленная.docx"`.
 Ошибки: 404 — нет джобы/результата; 400 — пустой `editIds` или нет исходного текста; 502 — ошибка LLM (`{"detail": "..."}`).
 
-### GET /api/jobs/{jobId}/export?format=md|html
+### GET /api/jobs/{jobId}/export?format=md|html|docx
 Возвращает файл со сводным отчётом по всем результатам джобы (`Content-Disposition: attachment`).
+`format=docx` — единый `.docx` (`di_check_<jobId>.docx`): титульный блок (дата, число файлов), сводная таблица (файл / вердикт / число правок / статус), затем по каждому файлу с done-статусом: заголовок с именем файла, отчёт (markdown→docx по тем же правилам, что в /fix), список правок (title, reason, «Было»/«Будет»).
+
+### POST /api/jobs/{jobId}/fix-all
+Body: `{ "items": [{ "resultIndex": 0, "editIds": ["e1", "e2"] }, ...] }` — пакетное исправление: для каждого item применить выбранные правки (та же логика, что /fix: LLM-вызов → исправленный текст → docx). Исполнение параллельно (семафор, как в /check).
+Ответ: 200, `Content-Type: application/zip`, `Content-Disposition: attachment; filename="ispravlennye_di.zip"`. В архиве: `<имя>_исправленная.docx` для каждого успешного item; если были неудачи (неизвестные editIds, нет исходного текста, ошибка LLM у конкретного файла) — дополнительно `_errors.txt` со списком «файл: причина».
+Ошибки уровня запроса: 404 — нет джобы; 400 — пустой `items` или resultIndex вне диапазона (это 400, а не failure item'а); 502 — если не удалось исправить ни одного файла.
 
 ## Хранение настроек
 

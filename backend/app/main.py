@@ -7,6 +7,8 @@ import io
 import json
 import re
 import uuid
+import zipfile
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -362,8 +364,8 @@ def _clean_md_inline(text: str) -> str:
     return text.replace("**", "").replace("__", "").replace("`", "").strip()
 
 
-def _markdown_to_docx(text: str) -> bytes:
-    """Простая генерация .docx из markdown-подобного текста модели."""
+def _markdown_into_docx(doc: Document, text: str) -> None:
+    """Добавляет markdown-подобный текст модели в существующий Document."""
     lines = text.strip().splitlines()
     # снять обрамление ```markdown ... ```, если модель всё же обернула ответ
     if lines and lines[0].strip().startswith("```"):
@@ -371,7 +373,6 @@ def _markdown_to_docx(text: str) -> bytes:
     if lines and lines[-1].strip() == "```":
         lines = lines[:-1]
 
-    doc = Document()
     for raw_line in lines:
         line = raw_line.rstrip()
         if not line.strip():
@@ -390,33 +391,36 @@ def _markdown_to_docx(text: str) -> bytes:
             doc.add_paragraph(_clean_md_inline(item), style="List Number")
         else:
             doc.add_paragraph(_clean_md_inline(line))
+
+
+def _markdown_to_docx(text: str) -> bytes:
+    """Простая генерация .docx из markdown-подобного текста модели."""
+    doc = Document()
+    _markdown_into_docx(doc, text)
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
 
-@app.post("/api/jobs/{job_id}/fix")
-async def fix_document(job_id: str, body: FixRequest):
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job_not_found")
-    if body.resultIndex < 0 or body.resultIndex >= len(job["results"]):
-        raise HTTPException(status_code=404, detail="result_not_found")
-    result = job["results"][body.resultIndex]
+class FixError(Exception):
+    """Ошибка применения правок к одному файлу (для /fix-all — в _errors.txt)."""
 
-    if not body.editIds:
-        raise HTTPException(status_code=400, detail="empty_edit_ids")
-    source_text = job.get("_texts", {}).get(body.resultIndex)
+
+async def _perform_fix(job: dict, result_index: int, edit_ids: list[str]) -> bytes:
+    """Общая логика /fix: LLM-вызов с правками → исправленный текст → docx."""
+    result = job["results"][result_index]
+
+    if not edit_ids:
+        raise FixError("empty_edit_ids")
+    source_text = job.get("_texts", {}).get(result_index)
     if not source_text:
-        raise HTTPException(status_code=400, detail="no_source_text")
+        raise FixError("no_source_text")
 
     by_id = {e["id"]: e for e in (result.get("edits") or [])}
-    unknown = [eid for eid in body.editIds if eid not in by_id]
+    unknown = [eid for eid in edit_ids if eid not in by_id]
     if unknown:
-        raise HTTPException(
-            status_code=400, detail=f"unknown_edit_ids: {', '.join(unknown)}"
-        )
-    chosen = [by_id[eid] for eid in body.editIds]
+        raise FixError(f"unknown_edit_ids: {', '.join(unknown)}")
+    chosen = [by_id[eid] for eid in edit_ids]
 
     edits_desc = "\n".join(
         f'{i}. Заменить «{e["original"]}» на «{e["replacement"]}»'
@@ -429,24 +433,113 @@ async def fix_document(job_id: str, body: FixRequest):
     )
 
     state = settings.get_settings_state()
+    fixed_text = await llm.chat_completion(
+        state["activeProvider"],
+        state["activeModel"],
+        FIX_SYSTEM_PROMPT,
+        user_message,
+    )
+
+    return await asyncio.to_thread(_markdown_to_docx, fixed_text)
+
+
+@app.post("/api/jobs/{job_id}/fix")
+async def fix_document(job_id: str, body: FixRequest):
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_not_found")
+    if body.resultIndex < 0 or body.resultIndex >= len(job["results"]):
+        raise HTTPException(status_code=404, detail="result_not_found")
+
     try:
-        fixed_text = await llm.chat_completion(
-            state["activeProvider"],
-            state["activeModel"],
-            FIX_SYSTEM_PROMPT,
-            user_message,
-        )
+        docx_bytes = await _perform_fix(job, body.resultIndex, body.editIds)
+    except FixError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except llm.LLMError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    docx_bytes = await asyncio.to_thread(_markdown_to_docx, fixed_text)
-    filename = f"{Path(result['filename']).stem}_исправленная.docx"
+    filename = f"{Path(job['results'][body.resultIndex]['filename']).stem}_исправленная.docx"
     return Response(
         content=docx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"
         },
+    )
+
+
+# ---------- Пакетное исправление (/fix-all) ----------
+
+class FixAllItem(BaseModel):
+    resultIndex: int
+    editIds: list[str]
+
+
+class FixAllRequest(BaseModel):
+    items: list[FixAllItem]
+
+
+async def _fix_one(
+    sem: asyncio.Semaphore, job: dict, item: FixAllItem
+) -> tuple[str, bytes | None, str | None]:
+    """Исправляет один файл. Возвращает (имя файла в архиве, docx | None, ошибка | None)."""
+    result = job["results"][item.resultIndex]
+    arcname = f"{Path(result['filename']).stem}_исправленная.docx"
+    async with sem:
+        try:
+            docx_bytes = await _perform_fix(job, item.resultIndex, item.editIds)
+        except (FixError, llm.LLMError) as e:
+            return arcname, None, str(e)
+    return arcname, docx_bytes, None
+
+
+@app.post("/api/jobs/{job_id}/fix-all")
+async def fix_all_documents(job_id: str, body: FixAllRequest):
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_not_found")
+    if not body.items:
+        raise HTTPException(status_code=400, detail="empty_items")
+    for item in body.items:
+        if item.resultIndex < 0 or item.resultIndex >= len(job["results"]):
+            raise HTTPException(
+                status_code=400, detail=f"result_index_out_of_range: {item.resultIndex}"
+            )
+
+    sem = asyncio.Semaphore(3)
+    outcomes = await asyncio.gather(*[_fix_one(sem, job, item) for item in body.items])
+
+    successes: list[tuple[str, bytes]] = []
+    failures: list[str] = []
+    for result_index, (arcname, docx_bytes, error) in zip(
+        (i.resultIndex for i in body.items), outcomes
+    ):
+        if docx_bytes is not None:
+            successes.append((arcname, docx_bytes))
+        else:
+            failures.append(f"{job['results'][result_index]['filename']}: {error}")
+
+    if not successes:
+        raise HTTPException(status_code=502, detail="no_files_fixed")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        used: set[str] = set()
+        for arcname, docx_bytes in successes:
+            # не допускаем коллизий имён при одинаковых исходных файлах
+            name = arcname
+            n = 2
+            while name in used:
+                name = f"{Path(arcname).stem}_{n}.docx"
+                n += 1
+            used.add(name)
+            zf.writestr(name, docx_bytes)
+        if failures:
+            zf.writestr("_errors.txt", "\n".join(failures) + "\n")
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="ispravlennye_di.zip"'},
     )
 
 
@@ -480,23 +573,76 @@ def _export_html(job: dict) -> str:
     )
 
 
+_VERDICT_LABELS = {"ok": "OK", "risk": "Есть риски", "fail": "Не соответствует"}
+
+
+def _export_docx(job: dict) -> bytes:
+    """Единый .docx-отчёт: титульный блок, сводная таблица, секции по файлам."""
+    doc = Document()
+    doc.add_heading("Сводный отчёт DI_Check", level=0)
+    doc.add_paragraph(f"Дата формирования: {datetime.now():%d.%m.%Y %H:%M}")
+    doc.add_paragraph(f"Файлов проверено: {len(job['results'])}")
+
+    doc.add_heading("Сводная таблица", level=1)
+    table = doc.add_table(rows=1, cols=4)
+    table.style = "Table Grid"
+    for cell, text in zip(
+        table.rows[0].cells, ("Файл", "Вердикт", "Правок", "Статус")
+    ):
+        cell.text = text
+    for r in job["results"]:
+        cells = table.add_row().cells
+        cells[0].text = r["filename"]
+        cells[1].text = _VERDICT_LABELS.get(r.get("summaryVerdict") or "", "—")
+        cells[2].text = str(len(r.get("edits") or []))
+        cells[3].text = r["status"]
+
+    for r in job["results"]:
+        if r["status"] != "done":
+            continue
+        doc.add_heading(f"Отчёт по файлу: {r['filename']}", level=1)
+        if r.get("report"):
+            _markdown_into_docx(doc, r["report"])
+        else:
+            doc.add_paragraph("Нет отчёта.")
+        edits = r.get("edits") or []
+        if edits:
+            doc.add_heading("Правки", level=2)
+            for e in edits:
+                doc.add_paragraph(
+                    f"{e['id']}. {e['title']}", style="List Number"
+                )
+                if e.get("reason"):
+                    doc.add_paragraph(f"Основание: {e['reason']}")
+                doc.add_paragraph(f"Было: {e['original']}")
+                doc.add_paragraph(f"Будет: {e['replacement']}")
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
 @app.get("/api/jobs/{job_id}/export")
 async def export_job(job_id: str, format: str = "md"):
     job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job_not_found")
     if format == "md":
-        content = _export_markdown(job)
+        content = _export_markdown(job).encode("utf-8")
         media_type = "text/markdown; charset=utf-8"
         ext = "md"
     elif format == "html":
-        content = _export_html(job)
+        content = _export_html(job).encode("utf-8")
         media_type = "text/html; charset=utf-8"
         ext = "html"
+    elif format == "docx":
+        content = await asyncio.to_thread(_export_docx, job)
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ext = "docx"
     else:
         raise HTTPException(status_code=400, detail="unsupported export format")
     return Response(
-        content=content.encode("utf-8"),
+        content=content,
         media_type=media_type,
         headers={
             "Content-Disposition": f'attachment; filename="di_check_{job_id}.{ext}"'

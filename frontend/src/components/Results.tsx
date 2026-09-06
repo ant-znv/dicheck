@@ -48,25 +48,23 @@ function EditsSection({
   resultIndex,
   filename,
   edits,
+  checked,
+  onToggle,
+  onSelectAll,
+  onClear,
   onError,
 }: {
   jobId: string
   resultIndex: number
   filename: string
   edits: Edit[]
+  checked: ReadonlySet<string>
+  onToggle: (id: string) => void
+  onSelectAll: () => void
+  onClear: () => void
   onError: (msg: string) => void
 }) {
-  const [checked, setChecked] = useState<Set<string>>(() => new Set(edits.map((e) => e.id)))
   const [fixing, setFixing] = useState(false)
-
-  const toggle = (id: string) => {
-    setChecked((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }
 
   const handleFix = async () => {
     setFixing(true)
@@ -101,14 +99,14 @@ function EditsSection({
         <div className="flex gap-2 text-xs">
           <button
             type="button"
-            onClick={() => setChecked(new Set(edits.map((e) => e.id)))}
+            onClick={onSelectAll}
             className="cursor-pointer rounded-lg border border-zinc-700 bg-zinc-800 px-2.5 py-1 font-medium text-zinc-300 transition-colors hover:bg-zinc-700"
           >
             Выбрать все
           </button>
           <button
             type="button"
-            onClick={() => setChecked(new Set())}
+            onClick={onClear}
             className="cursor-pointer rounded-lg border border-zinc-700 bg-zinc-800 px-2.5 py-1 font-medium text-zinc-300 transition-colors hover:bg-zinc-700"
           >
             Снять все
@@ -132,7 +130,7 @@ function EditsSection({
                 <input
                   type="checkbox"
                   checked={isChecked}
-                  onChange={() => toggle(edit.id)}
+                  onChange={() => onToggle(edit.id)}
                   className="mt-1 h-4 w-4 shrink-0 cursor-pointer accent-sky-500"
                 />
                 <span className="min-w-0 flex-1">
@@ -187,6 +185,11 @@ function EditsSection({
 
 export default function Results({ job, onError }: { job: Job; onError: (msg: string) => void }) {
   const [selected, setSelected] = useState<string | null>(null)
+  // Выбор правок по файлам: resultIndex -> набор выбранных editId.
+  // Отсутствующая запись = выбраны все правки файла (значение по умолчанию).
+  const [selection, setSelection] = useState<Record<number, ReadonlySet<string>>>({})
+  const [fixingAll, setFixingAll] = useState(false)
+  const [fixAllSummary, setFixAllSummary] = useState<string | null>(null)
 
   // Если выбранный файл исчез из результатов — сбрасываем выбор
   useEffect(() => {
@@ -198,6 +201,52 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
   const selectedIndex = job.results.findIndex((r) => r.filename === selected)
   const selectedResult = selectedIndex >= 0 ? job.results[selectedIndex] : null
   const done = job.status !== 'running'
+
+  const effectiveSelected = (resultIndex: number, edits: Edit[]): ReadonlySet<string> =>
+    selection[resultIndex] ?? new Set(edits.map((e) => e.id))
+
+  const updateSelection = (resultIndex: number, next: Set<string>) =>
+    setSelection((prev) => ({ ...prev, [resultIndex]: next }))
+
+  const toggleEdit = (resultIndex: number, edits: Edit[], id: string) => {
+    const next = new Set(effectiveSelected(resultIndex, edits))
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    updateSelection(resultIndex, next)
+  }
+
+  // Пакетное исправление: только done-файлы с ≥1 выбранной правкой
+  const fixAllItems = job.results
+    .map((r, resultIndex) => ({
+      resultIndex,
+      editIds: r.status === 'done' ? [...effectiveSelected(resultIndex, r.edits ?? [])] : [],
+    }))
+    .filter((item) => item.editIds.length > 0)
+
+  const handleFixAll = async () => {
+    setFixingAll(true)
+    setFixAllSummary(null)
+    try {
+      const blob = await api.fixAll(job.id, fixAllItems)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'ispravlennye_di.zip'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+      setFixAllSummary(
+        `Отправлено на исправление: ${fixAllItems.length} файл(ов). ` +
+          'Если какие-то файлы не удалось исправить, причины перечислены в _errors.txt внутри архива.',
+      )
+    } catch (e) {
+      if (e instanceof ApiError && e.detail) onError(e.detail)
+      else onError(e instanceof Error ? e.message : 'Не удалось выполнить пакетное исправление')
+    } finally {
+      setFixingAll(false)
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -213,25 +262,54 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
             <span className="ml-2 text-sm font-normal text-red-400">завершилась с ошибкой</span>
           )}
         </h2>
-        {done && (
-          <div className="flex gap-2">
-            <a
-              href={api.exportUrl(job.id, 'md')}
-              download
-              className="rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700"
-            >
-              Скачать MD
-            </a>
-            <a
-              href={api.exportUrl(job.id, 'html')}
-              download
-              className="rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700"
-            >
-              Скачать HTML
-            </a>
-          </div>
-        )}
       </div>
+
+      {done && (
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm text-zinc-400">Скачать общий отчёт:</span>
+              <a
+                href={api.exportUrl(job.id, 'docx')}
+                download
+                className="rounded-lg bg-sky-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-sky-500"
+              >
+                DOCX
+              </a>
+              <a
+                href={api.exportUrl(job.id, 'md')}
+                download
+                className="rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700"
+              >
+                MD
+              </a>
+              <a
+                href={api.exportUrl(job.id, 'html')}
+                download
+                className="rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700"
+              >
+                HTML
+              </a>
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleFixAll()}
+              disabled={fixingAll || fixAllItems.length === 0}
+              className="flex cursor-pointer items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {fixingAll && <Spinner />}
+              {fixingAll ? 'Исправляются документы…' : 'Исправить все ДИ'}
+            </button>
+          </div>
+          {fixingAll && (
+            <p className="mt-3 text-xs text-zinc-500">
+              Идёт пакетное исправление — по одному обращению к модели на каждую ДИ, это может
+              занять несколько минут. Не закрывайте страницу.
+            </p>
+          )}
+          {fixAllSummary && <p className="mt-3 text-xs text-emerald-400">{fixAllSummary}</p>}
+        </div>
+      )}
 
       <div className="overflow-x-auto rounded-xl border border-zinc-800">
         <table className="w-full text-left text-sm">
@@ -240,11 +318,12 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
               <th className="px-4 py-2.5 font-medium">Файл</th>
               <th className="px-4 py-2.5 font-medium">Статус</th>
               <th className="px-4 py-2.5 font-medium">Вердикт</th>
+              <th className="px-4 py-2.5 font-medium">Правки</th>
               <th className="px-4 py-2.5 font-medium">Отчёт</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-800">
-            {job.results.map((r) => {
+            {job.results.map((r, resultIndex) => {
               const st = STATUS_META[r.status]
               const isSelected = selected === r.filename
               return (
@@ -263,6 +342,15 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
                   <td className={`px-4 py-2.5 ${st.cls}`}>{st.label}</td>
                   <td className="px-4 py-2.5">
                     <VerdictBadge verdict={r.summaryVerdict} />
+                  </td>
+                  <td className="px-4 py-2.5">
+                    {(r.edits?.length ?? 0) > 0 ? (
+                      <span className="text-zinc-300">
+                        {effectiveSelected(resultIndex, r.edits).size}/{r.edits.length}
+                      </span>
+                    ) : (
+                      <span className="text-xs text-zinc-600">—</span>
+                    )}
                   </td>
                   <td className="px-4 py-2.5">
                     {r.report ? (
@@ -306,11 +394,16 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
           </article>
           {(selectedResult.edits?.length ?? 0) > 0 && (
             <EditsSection
-              key={selectedResult.filename}
               jobId={job.id}
               resultIndex={selectedIndex}
               filename={selectedResult.filename}
               edits={selectedResult.edits}
+              checked={effectiveSelected(selectedIndex, selectedResult.edits)}
+              onToggle={(id) => toggleEdit(selectedIndex, selectedResult.edits, id)}
+              onSelectAll={() =>
+                updateSelection(selectedIndex, new Set(selectedResult.edits.map((e) => e.id)))
+              }
+              onClear={() => updateSelection(selectedIndex, new Set<string>())}
               onError={onError}
             />
           )}

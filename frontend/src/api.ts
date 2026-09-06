@@ -45,6 +45,11 @@ export interface Job {
   results: JobResult[]
 }
 
+export interface FixAllItem {
+  resultIndex: number
+  editIds: string[]
+}
+
 export class ApiError extends Error {
   status: number
   detail: string | null
@@ -135,6 +140,9 @@ export const api = {
   fixDocument: (jobId: string, resultIndex: number, editIds: string[]) =>
     requestBlob(`/api/jobs/${jobId}/fix`, jsonInit('POST', { resultIndex, editIds })),
 
-  exportUrl: (jobId: string, format: 'md' | 'html') =>
+  fixAll: (jobId: string, items: FixAllItem[]) =>
+    requestBlob(`/api/jobs/${jobId}/fix-all`, jsonInit('POST', { items })),
+
+  exportUrl: (jobId: string, format: 'md' | 'html' | 'docx') =>
     `/api/jobs/${jobId}/export?format=${format}`,
 }

@@ -150,7 +150,7 @@ export default function App() {
               })
             }
           />
-          {job && <Results job={job} onError={showError} />}
+          {job && <Results key={job.id} job={job} onError={showError} />}
         </main>
       </div>
 

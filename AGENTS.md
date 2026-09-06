@@ -13,7 +13,7 @@ DI_Check — локальное веб-приложение для провер�
   - `settings.py` — конфиг в `%APPDATA%\DI_Check\config.json`, API-ключи шифруются DPAPI;
   - `default_prompt.md` — системный промт по умолчанию (из `analiz-DI-goskontrakt-v4.docx`, раздел «2. Промт для ИИ»).
 - `frontend/` — React 19 + TypeScript + Vite 7 + Tailwind CSS v4; сборка в `frontend/dist`, раздаётся бэкендом как статика.
-- `backend/testdata/` — тестовая ДИ (`sample_di.docx`, генератор `make_sample.py`) и примеры отчётов.
+- `backend/testdata/` — тестовые ДИ (`sample_di.docx`, генератор `make_sample.py`; доп. вариации — `make_samples_batch.py`), примеры отчётов, сквозной тест `verify_batch.py` (check → export docx → fix-all, нужен запущенный сервер и API-ключ).
 - `requirements.txt` — зависимости бэкенда, ставятся в `.venv` в корне.
 
 ## Команды
