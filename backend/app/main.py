@@ -274,6 +274,10 @@ async def _check_file(
 ) -> None:
     started = time.monotonic()
     try:
+        if job.get("cancel_requested"):
+            # отмена пришла до старта задачи (узкое окно между create_check и _run_job)
+            result["status"] = "cancelled"
+            return
         async with _semaphore:
             result["status"] = "running"
             try:
