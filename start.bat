@@ -14,7 +14,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 REM --- 2. Zavisimosti backend ---
-if not exist ".venv\Lib\site-packagesastapi" (
+if not exist ".venv\Lib\site-packages\fastapi" (
     echo [DI_Check] Ustanavlivayu zavisimosti backend...
     .venv\Scripts\python.exe -m pip install -r requirements.txt
     if errorlevel 1 (

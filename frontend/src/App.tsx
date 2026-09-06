@@ -5,6 +5,8 @@ import CheckPanel, { type CheckContext } from './components/CheckPanel'
 import Results from './components/Results'
 import Toast, { type ToastData } from './components/Toast'
 
+const JOB_ID_KEY = 'di_check_job_id'
+
 export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [settingsError, setSettingsError] = useState<string | null>(null)
@@ -14,6 +16,7 @@ export default function App() {
   const [starting, setStarting] = useState(false)
   const [noApiKey, setNoApiKey] = useState(false)
   const pollRef = useRef<number | null>(null)
+  const pollFailuresRef = useRef(0)
 
   useEffect(() => {
     api
@@ -35,6 +38,54 @@ export default function App() {
 
   const showError = useCallback((msg: string) => setToast({ type: 'error', text: msg }), [])
 
+  // Поллинг статуса джобы: одиночные сбои сети переживаем молча,
+  // останавливаемся и показываем ошибку только после 3 неудач подряд.
+  const startPolling = useCallback(
+    async (jobId: string) => {
+      stopPolling()
+      pollFailuresRef.current = 0
+      const poll = async () => {
+        try {
+          const j = await api.getJob(jobId)
+          pollFailuresRef.current = 0
+          setJob(j)
+          if (j.status !== 'running') stopPolling()
+        } catch (e) {
+          pollFailuresRef.current += 1
+          if (pollFailuresRef.current >= 3) {
+            stopPolling()
+            showError(e instanceof Error ? e.message : 'Ошибка получения статуса проверки')
+          }
+        }
+      }
+      await poll()
+      pollRef.current = window.setInterval(() => void poll(), 1500)
+    },
+    [showError, stopPolling],
+  )
+
+  // Восстановление джобы после перезагрузки страницы.
+  // Если джоба не найдена (например, истекла после перезапуска сервера) —
+  // тихо удаляем ключ, без показа ошибки пользователю.
+  useEffect(() => {
+    const saved = localStorage.getItem(JOB_ID_KEY)
+    if (!saved) return
+    let cancelled = false
+    api
+      .getJob(saved)
+      .then((j) => {
+        if (cancelled) return
+        setJob(j)
+        if (j.status === 'running') void startPolling(saved)
+      })
+      .catch(() => {
+        if (!cancelled) localStorage.removeItem(JOB_ID_KEY)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [startPolling])
+
   const activeProvider = settings?.providers.find((p) => p.id === settings.activeProvider)
 
   const startCheck = useCallback(
@@ -50,19 +101,8 @@ export default function App() {
         if (ctx.extraContext.trim()) form.append('extraContext', ctx.extraContext.trim())
 
         const { jobId } = await api.startCheck(form)
-
-        const poll = async () => {
-          try {
-            const j = await api.getJob(jobId)
-            setJob(j)
-            if (j.status !== 'running') stopPolling()
-          } catch (e) {
-            stopPolling()
-            showError(e instanceof Error ? e.message : 'Ошибка получения статуса проверки')
-          }
-        }
-        await poll()
-        pollRef.current = window.setInterval(() => void poll(), 1500)
+        localStorage.setItem(JOB_ID_KEY, jobId)
+        await startPolling(jobId)
       } catch (e) {
         if (e instanceof ApiError && e.status === 409 && e.detail === 'no_api_key') {
           setNoApiKey(true)
@@ -73,7 +113,7 @@ export default function App() {
         setStarting(false)
       }
     },
-    [showError, stopPolling],
+    [showError, startPolling, stopPolling],
   )
 
   return (

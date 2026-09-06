@@ -5,7 +5,9 @@ import asyncio
 import html as html_mod
 import io
 import json
+import logging
 import re
+import time
 import uuid
 import zipfile
 from datetime import datetime
@@ -13,6 +15,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from docx import Document
+from docx.text.paragraph import Paragraph
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -20,6 +23,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import extractors, llm, settings
+
+logger = logging.getLogger("di_check")
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 app = FastAPI(title="DI_Check")
 
@@ -38,6 +48,15 @@ app.add_middleware(
 # Джобы в памяти
 _jobs: dict[str, dict] = {}
 _semaphore = asyncio.Semaphore(3)
+# Сильные ссылки на фоновые задачи (иначе create_task может быть собран GC)
+_run_tasks: set[asyncio.Task] = set()
+
+# Лимиты входа и хранения
+MAX_FILES = 20
+MAX_FILE_SIZE = 20 * 1024 * 1024  # байт на файл
+MAX_TEXT_CHARS = 120_000          # предел текста ДИ в user-message
+JOB_TTL_SECONDS = 24 * 3600       # сколько жить завершённой джобе
+MAX_JOBS = 50                     # максимум джоб в памяти
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 
@@ -126,6 +145,7 @@ def _build_user_message(
 
 
 def _summary_verdict(report: str) -> str:
+    """Эвристический вердикт по тексту отчёта (fallback, если модель не отдала свой)."""
     low = report.lower()
     if "не соответствует" in low:
         return "fail"
@@ -142,11 +162,13 @@ EDITS_INSTRUCTION = """
 
 ---
 
-В КОНЦЕ своего ответа обязательно выведи fenced-блок ```json со списком конкретных правок текста должностной инструкции в формате:
+В КОНЦЕ своего ответа обязательно выведи fenced-блок ```json со сводным вердиктом и списком конкретных правок текста должностной инструкции в формате:
 
 ```json
-{"edits": [{"id": "e1", "title": "краткое название правки", "original": "дословная цитата из текста ДИ, которую нужно изменить", "replacement": "готовая формулировка для вставки вместо цитаты", "reason": "почему нужна правка (норма/риск)"}]}
+{"verdict": "risk", "edits": [{"id": "e1", "title": "краткое название правки", "original": "дословная цитата из текста ДИ, которую нужно изменить", "replacement": "готовая формулировка для вставки вместо цитаты", "reason": "почему нужна правка (норма/риск)"}]}
 ```
+
+где verdict — общий вердикт по всей ДИ: "ok" (соответствует), "risk" (есть риски) или "fail" (не соответствует).
 
 Требования к правкам:
 - original — точная дословная цитата фрагмента текста инструкции; если подходящего фрагмента нет (например, раздел нужно добавить), опиши место вставки;
@@ -157,6 +179,7 @@ EDITS_INSTRUCTION = """
 
 _FENCED_RE = re.compile(r"```[ \t]*(\w*)[ \t]*\r?\n(.*?)```", re.DOTALL)
 _EDIT_KEYS = ("id", "title", "original", "replacement", "reason")
+_VALID_VERDICTS = {"ok", "risk", "fail"}
 
 
 def _normalize_edits(data: object) -> list[dict] | None:
@@ -200,37 +223,45 @@ def _matching_brace(text: str, start: int) -> int:
     return -1
 
 
-def _parse_edits(report: str) -> tuple[str, list[dict]]:
-    """Извлекает блок {"edits": [...]} из ответа модели.
+def _parse_edits(report: str) -> tuple[str, list[dict], str | None]:
+    """Извлекает блок {"verdict": ..., "edits": [...]} из ответа модели.
 
-    Возвращает (очищенный отчёт, список правок). Если парсинг не удался —
-    (исходный отчёт, []).
+    Возвращает (очищенный отчёт, список правок, вердикт | None). Вердикт берётся
+    из structured-блока; если его нет — вызывающий код использует эвристику.
+    Если парсинг не удался — (исходный отчёт, [], None).
     """
     # 1) последний fenced-блок, содержащий {"edits": ...}
     for m in reversed(list(_FENCED_RE.finditer(report))):
-        edits = None
         try:
-            edits = _normalize_edits(json.loads(m.group(2).strip()))
+            data = json.loads(m.group(2).strip())
         except json.JSONDecodeError:
             continue
+        edits = _normalize_edits(data)
         if edits is not None:
-            return (report[: m.start()] + report[m.end() :]).strip(), edits
+            verdict = data.get("verdict")
+            return (
+                (report[: m.start()] + report[m.end() :]).strip(),
+                edits,
+                verdict if verdict in _VALID_VERDICTS else None,
+            )
     # 2) brace-matching от последнего '{"edits"'
     idx = report.rfind('{"edits"')
     if idx != -1:
         end = _matching_brace(report, idx)
         if end != -1:
             try:
-                edits = _normalize_edits(json.loads(report[idx:end]))
+                data = json.loads(report[idx:end])
             except json.JSONDecodeError:
-                edits = None
+                data = None
+            edits = _normalize_edits(data)
             if edits is not None:
+                verdict = data.get("verdict") if isinstance(data, dict) else None
                 cleaned = (report[:idx] + report[end:]).strip()
                 # убрать осиротевшие fence-ограждения вокруг удалённого блока
                 cleaned = re.sub(r"```[ \t]*(?:json)?[ \t]*$", "", cleaned).strip()
                 cleaned = re.sub(r"^[ \t]*```", "", cleaned).strip()
-                return cleaned, edits
-    return report, []
+                return cleaned, edits, verdict if verdict in _VALID_VERDICTS else None
+    return report, [], None
 
 
 async def _check_file(
@@ -241,45 +272,116 @@ async def _check_file(
     user_fields: dict,
     state: dict,
 ) -> None:
-    async with _semaphore:
-        result["status"] = "running"
-        try:
-            text = await asyncio.to_thread(
-                extractors.extract_text, result["filename"], data
-            )
-        except extractors.ExtractionError as e:
-            result["status"] = "error"
-            result["error"] = str(e)
-            return
-        # исходный текст хранится в джобе (не отдаётся через GET) — нужен для /fix
-        job["_texts"][index] = text
-        user_message = _build_user_message(result["filename"], text, **user_fields)
-        try:
+    started = time.monotonic()
+    try:
+        async with _semaphore:
+            result["status"] = "running"
+            try:
+                text = await asyncio.to_thread(
+                    extractors.extract_text, result["filename"], data
+                )
+            except extractors.ExtractionError as e:
+                result["status"] = "error"
+                result["error"] = str(e)
+                logger.warning(
+                    "Джоба %s, файл %s: извлечение текста не удалось: %s",
+                    job["id"], result["filename"], e,
+                )
+                return
+            if len(text) > MAX_TEXT_CHARS:
+                text = text[:MAX_TEXT_CHARS]
+                result["textTruncated"] = True
+                logger.warning(
+                    "Джоба %s, файл %s: текст обрезан до %d символов (слишком длинный)",
+                    job["id"], result["filename"], MAX_TEXT_CHARS,
+                )
+            # исходный текст и байты хранятся в джобе (не отдаются через GET):
+            # текст нужен для /fix, байты — для детерминированных правок .docx
+            job["_texts"][index] = text
+            job["_files"][index] = data
+            user_message = _build_user_message(result["filename"], text, **user_fields)
             raw_report = await llm.chat_completion(
                 state["activeProvider"],
                 state["activeModel"],
                 state["systemPrompt"] + EDITS_INSTRUCTION,
                 user_message,
             )
-            report, edits = _parse_edits(raw_report)
+            report, edits, verdict = _parse_edits(raw_report)
             result["report"] = report
             result["edits"] = edits
-            result["summaryVerdict"] = _summary_verdict(report)
+            result["summaryVerdict"] = verdict or _summary_verdict(report)
             result["status"] = "done"
-        except llm.LLMError as e:
-            result["status"] = "error"
-            result["error"] = str(e)
+            logger.info(
+                "Джоба %s, файл %s: готово за %.1f с, правок %d, вердикт %s",
+                job["id"], result["filename"], time.monotonic() - started,
+                len(edits), result["summaryVerdict"],
+            )
+    except asyncio.CancelledError:
+        # отмену не пробрасываем: gather соберёт задачу, джоба получит статус cancelled
+        result["status"] = "cancelled"
+        logger.info("Джоба %s, файл %s: проверка отменена", job["id"], result["filename"])
+    except llm.LLMError as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+        logger.warning(
+            "Джоба %s, файл %s: ошибка LLM: %s", job["id"], result["filename"], e
+        )
+    except Exception:
+        logger.exception(
+            "Джоба %s, файл %s: неожиданная ошибка проверки", job["id"], result["filename"]
+        )
+        result["status"] = "error"
+        result["error"] = "Внутренняя ошибка проверки (подробности в логе сервера)"
 
 
 async def _run_job(job_id: str, files: list[tuple[str, bytes]], user_fields: dict) -> None:
     job = _jobs[job_id]
     state = settings.get_settings_state()
     tasks = [
-        _check_file(job, index, result, data, user_fields, state)
+        asyncio.create_task(_check_file(job, index, result, data, user_fields, state))
         for index, (result, (_, data)) in enumerate(zip(job["results"], files))
     ]
-    await asyncio.gather(*tasks)
-    job["status"] = "done"
+    job["tasks"] = tasks
+    try:
+        # исключения _check_file обрабатывает сам; gather — страховка
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        job["tasks"] = []
+    for out in outcomes:
+        if isinstance(out, BaseException) and not isinstance(out, asyncio.CancelledError):
+            logger.error("Джоба %s: задача проверки упала исключением: %r", job_id, out)
+    if job.get("cancel_requested"):
+        job["status"] = "cancelled"
+    elif all(r["status"] == "error" for r in job["results"]):
+        job["status"] = "error"
+    else:
+        job["status"] = "done"
+    logger.info("Джоба %s завершена, статус: %s", job_id, job["status"])
+
+
+def _evict_expired_jobs() -> None:
+    """Выгружает завершённые джобы старше TTL и сверх MAX_JOBS (активные не трогаем)."""
+    now = time.monotonic()
+    expired = [
+        j for j in _jobs.values()
+        if j["status"] != "running" and now - j["created_at"] > JOB_TTL_SECONDS
+    ]
+    for j in expired:
+        del _jobs[j["id"]]
+    if expired:
+        logger.info("Выгружено просроченных джоб: %d", len(expired))
+    while len(_jobs) > MAX_JOBS:
+        finished = sorted(
+            (j for j in _jobs.values() if j["status"] != "running"),
+            key=lambda j: j["created_at"],
+        )
+        if not finished:
+            break
+        oldest = finished[0]
+        del _jobs[oldest["id"]]
+        logger.info(
+            "Выгружена старая джоба %s (превышен лимит %d джоб)", oldest["id"], MAX_JOBS
+        )
 
 
 @app.post("/api/check")
@@ -295,6 +397,11 @@ async def create_check(
 
     if not files:
         raise HTTPException(status_code=400, detail="no_files")
+    if len(files) > MAX_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"too_many_files: {len(files)} (максимум {MAX_FILES})",
+        )
 
     payloads: list[tuple[str, bytes]] = []
     results = []
@@ -308,6 +415,14 @@ async def create_check(
         data = await f.read()
         if not data:
             raise HTTPException(status_code=400, detail=f"empty_file: {f.filename}")
+        if len(data) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"file_too_large: {f.filename} "
+                    f"(максимум {MAX_FILE_SIZE // (1024 * 1024)} МБ)"
+                ),
+            )
         payloads.append((f.filename, data))
         results.append(
             {
@@ -317,22 +432,35 @@ async def create_check(
                 "report": None,
                 "summaryVerdict": None,
                 "edits": None,
+                "textTruncated": False,
             }
         )
+
+    _evict_expired_jobs()
 
     job_id = uuid.uuid4().hex[:12]
     _jobs[job_id] = {
         "id": job_id,
         "status": "running",
+        "created_at": time.monotonic(),
         "results": results,
         "_texts": {},  # index результата -> извлечённый текст (наружу не отдаётся)
+        "_files": {},  # index результата -> исходные байты файла (для правок .docx)
+        "tasks": [],   # активные задачи файлов (для отмены)
+        "cancel_requested": False,
     }
     user_fields = {
         "contract_subject": contractSubject,
         "employment_type": employmentType,
         "extra_context": extraContext,
     }
-    asyncio.create_task(_run_job(job_id, payloads, user_fields))
+    task = asyncio.create_task(_run_job(job_id, payloads, user_fields))
+    _run_tasks.add(task)
+    task.add_done_callback(_run_tasks.discard)
+    logger.info(
+        "Джоба %s запущена: файлов %d, провайдер %s, модель %s",
+        job_id, len(files), state["activeProvider"], state["activeModel"],
+    )
     return {"jobId": job_id}
 
 
@@ -341,8 +469,23 @@ async def get_job(job_id: str):
     job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job_not_found")
-    # служебные поля ("_texts" и т.п.) наружу не отдаём
+    # служебные поля ("_texts", "_files", "tasks" и т.п.) наружу не отдаём
     return {"id": job["id"], "status": job["status"], "results": job["results"]}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Отменяет проверку: файлы в работе прерываются, ожидающие — получают cancelled."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_not_found")
+    if job["status"] != "running":
+        return {"ok": True, "status": job["status"]}
+    job["cancel_requested"] = True
+    for task in list(job.get("tasks") or []):
+        task.cancel()
+    logger.info("Джоба %s: запрошена отмена", job_id)
+    return {"ok": True}
 
 
 # ---------- Применение правок (/fix) ----------
@@ -406,8 +549,116 @@ class FixError(Exception):
     """Ошибка применения правок к одному файлу (для /fix-all — в _errors.txt)."""
 
 
-async def _perform_fix(job: dict, result_index: int, edit_ids: list[str]) -> bytes:
-    """Общая логика /fix: LLM-вызов с правками → исправленный текст → docx."""
+# ---------- Детерминированное применение правок к исходному .docx ----------
+
+def _iter_table_paragraphs(table):
+    for row in table.rows:
+        for cell in row.cells:
+            yield from cell.paragraphs
+            for nested in cell.tables:
+                yield from _iter_table_paragraphs(nested)
+
+
+def _iter_docx_paragraphs(doc: Document):
+    """Все абзацы документа: тело, таблицы и непустые колонтитулы."""
+    yield from doc.paragraphs
+    for table in doc.tables:
+        yield from _iter_table_paragraphs(table)
+    for section in doc.sections:
+        for hf in (
+            section.header,
+            section.footer,
+            section.first_page_header,
+            section.first_page_footer,
+            section.even_page_header,
+            section.even_page_footer,
+        ):
+            try:
+                if hf.is_linked_to_previous:
+                    continue
+                yield from hf.paragraphs
+                for table in hf.tables:
+                    yield from _iter_table_paragraphs(table)
+            except Exception:
+                continue
+
+
+def _replace_in_paragraph(par: Paragraph, original: str, replacement: str) -> bool:
+    """Заменяет original на replacement в абзаце, работая с runs.
+
+    Форматирование первого затронутого run'а распространяется на replacement.
+    Возвращает False, если original не найден в runs абзаца.
+    """
+    runs = par.runs
+    joined = "".join(r.text for r in runs)
+    idx = joined.find(original)
+    if idx == -1:
+        return False
+    end = idx + len(original)
+    pos = 0
+    placed = False
+    for r in runs:
+        r_start = pos
+        r_end = pos + len(r.text)
+        pos = r_end
+        if r_end <= idx or r_start >= end:
+            continue  # run вне диапазона замены
+        prefix = r.text[: max(0, idx - r_start)]
+        suffix = r.text[max(0, end - r_start):]
+        r.text = (prefix + replacement + suffix) if not placed else (prefix + suffix)
+        placed = True
+    return True
+
+
+def _apply_edits_to_docx(
+    data: bytes, edits: list[dict]
+) -> tuple[Document | None, list[dict]]:
+    """Применяет правки к копии исходного .docx, сохраняя форматирование.
+
+    Возвращает (Document | None, правки, которые не удалось применить на уровне
+    runs — их добирает LLM-фолбэк).
+    """
+    try:
+        doc = Document(io.BytesIO(data))
+    except Exception as e:
+        logger.warning("Детерминированные правки отменены: .docx не открылся: %s", e)
+        return None, list(edits)
+    failed: list[dict] = []
+    for e in edits:
+        applied = False
+        if e["original"]:
+            for par in _iter_docx_paragraphs(doc):
+                joined = "".join(r.text for r in par.runs)
+                if e["original"] in joined and _replace_in_paragraph(
+                    par, e["original"], e["replacement"]
+                ):
+                    applied = True
+                    break
+        if not applied:
+            failed.append(e)
+    return doc, failed
+
+
+def _build_fix_message(source_text: str, edits: list[dict]) -> str:
+    edits_desc = "\n".join(
+        f'{i}. Заменить «{e["original"]}» на «{e["replacement"]}»'
+        + (f' (основание: {e["reason"]})' if e["reason"] else "")
+        for i, e in enumerate(edits, 1)
+    )
+    return (
+        f"Исходный текст должностной инструкции:\n\n{source_text}\n\n"
+        f"---\n\nПравки, которые нужно внести:\n{edits_desc}"
+    )
+
+
+async def _perform_fix(job: dict, result_index: int, edit_ids: list[str]) -> tuple[bytes, str]:
+    """Применяет правки к ДИ. Возвращает (docx-байты, способ: "docx"|"text"|"llm").
+
+    Правки с дословной уникальной цитатой применяются без LLM: для исходного
+    .docx — прямо в документе (сохраняя форматирование), для остальных
+    источников — пересборкой из обновлённого текста. Недетерминированные правки
+    (вставки, цитаты не найдены) добирает LLM-фолбэк.
+    """
     result = job["results"][result_index]
 
     if not edit_ids:
@@ -422,25 +673,47 @@ async def _perform_fix(job: dict, result_index: int, edit_ids: list[str]) -> byt
         raise FixError(f"unknown_edit_ids: {', '.join(unknown)}")
     chosen = [by_id[eid] for eid in edit_ids]
 
-    edits_desc = "\n".join(
-        f'{i}. Заменить «{e["original"]}» на «{e["replacement"]}»'
-        + (f' (основание: {e["reason"]})' if e["reason"] else "")
-        for i, e in enumerate(chosen, 1)
-    )
-    user_message = (
-        f"Исходный текст должностной инструкции:\n\n{source_text}\n\n"
-        f"---\n\nПравки, которые нужно внести:\n{edits_desc}"
-    )
+    # 1) детерминированная часть: дословная цитата, уникальная в исходном тексте
+    rest: list[dict] = []
+    updated_text = source_text
+    exact_applied: list[dict] = []
+    for e in chosen:
+        if e["original"] and source_text.count(e["original"]) == 1:
+            if e["original"] in updated_text:
+                updated_text = updated_text.replace(e["original"], e["replacement"], 1)
+                exact_applied.append(e)
+            else:
+                rest.append(e)  # предыдущая замена задела текст этой правки
+        else:
+            rest.append(e)
 
+    docx_data = job.get("_files", {}).get(result_index)
+    if (
+        exact_applied
+        and docx_data
+        and Path(result["filename"]).suffix.lower() == ".docx"
+    ):
+        doc, failed = await asyncio.to_thread(_apply_edits_to_docx, docx_data, exact_applied)
+        rest = failed + rest
+        if doc is not None and not failed:
+            buf = io.BytesIO()
+            await asyncio.to_thread(doc.save, buf)
+            return buf.getvalue(), "docx"
+        # если часть правок не легла на уровень runs — добираем через LLM ниже
+
+    if exact_applied and not rest:
+        # исходник не .docx (или без байтов), зато все правки применились к тексту
+        return await asyncio.to_thread(_markdown_to_docx, updated_text), "text"
+
+    # 2) LLM-фолбэк: вставки и цитаты, которые не удалось применить дословно
     state = settings.get_settings_state()
     fixed_text = await llm.chat_completion(
         state["activeProvider"],
         state["activeModel"],
         FIX_SYSTEM_PROMPT,
-        user_message,
+        _build_fix_message(updated_text, rest),
     )
-
-    return await asyncio.to_thread(_markdown_to_docx, fixed_text)
+    return await asyncio.to_thread(_markdown_to_docx, fixed_text), "llm"
 
 
 @app.post("/api/jobs/{job_id}/fix")
@@ -452,12 +725,15 @@ async def fix_document(job_id: str, body: FixRequest):
         raise HTTPException(status_code=404, detail="result_not_found")
 
     try:
-        docx_bytes = await _perform_fix(job, body.resultIndex, body.editIds)
+        docx_bytes, method = await _perform_fix(job, body.resultIndex, body.editIds)
     except FixError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except llm.LLMError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
+    logger.info(
+        "Fix %s[%d]: применено методом %s", job_id, body.resultIndex, method
+    )
     filename = f"{Path(job['results'][body.resultIndex]['filename']).stem}_исправленная.docx"
     return Response(
         content=docx_bytes,
@@ -487,9 +763,15 @@ async def _fix_one(
     arcname = f"{Path(result['filename']).stem}_исправленная.docx"
     async with sem:
         try:
-            docx_bytes = await _perform_fix(job, item.resultIndex, item.editIds)
+            docx_bytes, method = await _perform_fix(job, item.resultIndex, item.editIds)
         except (FixError, llm.LLMError) as e:
+            logger.warning(
+                "Fix-all %s[%d]: не удалось: %s", job["id"], item.resultIndex, e
+            )
             return arcname, None, str(e)
+    logger.info(
+        "Fix-all %s[%d]: применено методом %s", job["id"], item.resultIndex, method
+    )
     return arcname, docx_bytes, None
 
 
@@ -551,6 +833,8 @@ def _export_markdown(job: dict) -> str:
         lines.append(f"\n---\n\n## {r['filename']}\n")
         if r["status"] == "error":
             lines.append(f"**Ошибка:** {r['error']}\n")
+        elif r["status"] == "cancelled":
+            lines.append("_Проверка отменена._\n")
         elif r["report"]:
             lines.append(r["report"] + "\n")
         else:

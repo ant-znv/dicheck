@@ -32,16 +32,17 @@ export interface Edit {
 
 export interface JobResult {
   filename: string
-  status: 'pending' | 'running' | 'done' | 'error'
+  status: 'pending' | 'running' | 'done' | 'error' | 'cancelled'
   error: string | null
   report: string | null
   summaryVerdict: Verdict | null
   edits: Edit[]
+  textTruncated?: boolean
 }
 
 export interface Job {
   id: string
-  status: 'running' | 'done' | 'error'
+  status: 'running' | 'done' | 'error' | 'cancelled'
   results: JobResult[]
 }
 
@@ -136,6 +137,9 @@ export const api = {
     request<{ jobId: string }>('/api/check', { method: 'POST', body: form }),
 
   getJob: (jobId: string) => request<Job>(`/api/jobs/${jobId}`),
+
+  cancelJob: (jobId: string) =>
+    request<{ ok: boolean }>(`/api/jobs/${jobId}/cancel`, { method: 'POST' }),
 
   fixDocument: (jobId: string, resultIndex: number, editIds: string[]) =>
     requestBlob(`/api/jobs/${jobId}/fix`, jsonInit('POST', { resultIndex, editIds })),

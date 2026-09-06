@@ -14,12 +14,14 @@ DI_Check — локальное веб-приложение для провер�
   - `default_prompt.md` — системный промт по умолчанию (из `analiz-DI-goskontrakt-v4.docx`, раздел «2. Промт для ИИ»).
 - `frontend/` — React 19 + TypeScript + Vite 7 + Tailwind CSS v4; сборка в `frontend/dist`, раздаётся бэкендом как статика.
 - `backend/testdata/` — тестовые ДИ (`sample_di.docx`, генератор `make_sample.py`; доп. вариации — `make_samples_batch.py`), примеры отчётов, сквозной тест `verify_batch.py` (check → export docx → fix-all, нужен запущенный сервер и API-ключ).
-- `requirements.txt` — зависимости бэкенда, ставятся в `.venv` в корне.
+- `requirements.txt` — зависимости бэкенда, ставятся в `.venv` в корне; `requirements.lock.txt` — зафиксированные версии (`pip freeze`).
+- `backend/tests/` — pytest-сьют бэкенда (LLM мокается, сеть/ключи/Word/Tesseract не нужны); запуск из корня проекта.
 
 ## Команды
 
 - Запуск всего: `start.bat`
 - Бэкенд вручную: `.venv/Scripts/python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8787`
+- Тесты бэкенда: `.venv/Scripts/python.exe -X utf8 -m pytest backend/tests -q`
 - Фронтенд dev (прокси на 8787): `cd frontend && npm run dev`
 - Фронтенд сборка: `cd frontend && npm run build`
 - Python в консоли Windows: вывод русского текста только в файл с `encoding='utf-8'` (консоль cp1251 падает на `print`); либо `python -X utf8`.
@@ -30,8 +32,7 @@ DI_Check — локальное веб-приложение для провер�
 - API-контракт фронтенд↔бэкенд — `docs/api-contract.md`; при изменении API обновлять его.
 - API-ключи никогда не возвращать через API наружу — только флаг `hasApiKey`.
 
-## Git hazard
+## Git
 
-- В workspace **нет своего git-репозитория**. Git из этой директории резолвится на stray-репо с корнем `C:\`, который видит весь диск как untracked.
-- Никогда не запускать `git add`, `git add -A`, `git commit`, `git clean` отсюда — это затронет весь диск `C:\`.
-- Если нужен версионный контроль: сначала `git init` в ``, потом коммитить там.
+- Git-репозиторий — корень проекта `` (инициализирован 2026-09-06). Все git-команды выполнять только внутри него.
+- Hazard: git из родительских директорий (например, из корня `C:\`) резолвится на stray-репо, который видит весь диск как untracked. Никогда не запускать `git add`/`git commit`/`git clean` за пределами проекта.

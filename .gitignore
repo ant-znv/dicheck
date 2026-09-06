@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 frontend/node_modules/
 frontend/dist/
+
+# локальные тестовые артефакты
+test-*.docx
+backend/testdata/last_*
+backend/testdata/integration_*
+backend/testdata/batch_report.docx
+backend/testdata/fixed_*

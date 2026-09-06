@@ -14,6 +14,7 @@ const STATUS_META: Record<JobResult['status'], { label: string; cls: string }> =
   running: { label: 'Проверяется…', cls: 'text-sky-400' },
   done: { label: 'Готово', cls: 'text-emerald-400' },
   error: { label: 'Ошибка', cls: 'text-red-400' },
+  cancelled: { label: 'Отменено', cls: 'text-zinc-500' },
 }
 
 function VerdictBadge({ verdict }: { verdict: Verdict | null }) {
@@ -184,23 +185,42 @@ function EditsSection({
 }
 
 export default function Results({ job, onError }: { job: Job; onError: (msg: string) => void }) {
-  const [selected, setSelected] = useState<string | null>(null)
+  // Выбранный результат — индекс в job.results (resultIndex), а не имя файла.
+  const [selected, setSelected] = useState<number | null>(null)
   // Выбор правок по файлам: resultIndex -> набор выбранных editId.
   // Отсутствующая запись = выбраны все правки файла (значение по умолчанию).
   const [selection, setSelection] = useState<Record<number, ReadonlySet<string>>>({})
   const [fixingAll, setFixingAll] = useState(false)
   const [fixAllSummary, setFixAllSummary] = useState<string | null>(null)
+  const [cancelling, setCancelling] = useState(false)
 
-  // Если выбранный файл исчез из результатов — сбрасываем выбор
+  // Если выбранный индекс вышел за пределы результатов — сбрасываем выбор
   useEffect(() => {
-    if (selected && !job.results.some((r) => r.filename === selected)) {
+    if (selected !== null && selected >= job.results.length) {
       setSelected(null)
     }
   }, [job, selected])
 
-  const selectedIndex = job.results.findIndex((r) => r.filename === selected)
+  const selectedIndex = selected !== null && selected < job.results.length ? selected : -1
   const selectedResult = selectedIndex >= 0 ? job.results[selectedIndex] : null
   const done = job.status !== 'running'
+
+  // Завершённые файлы (независимо от исхода) для индикатора прогресса
+  const doneCount = job.results.filter(
+    (r) => r.status === 'done' || r.status === 'error' || r.status === 'cancelled',
+  ).length
+
+  const handleCancel = async () => {
+    setCancelling(true)
+    try {
+      await api.cancelJob(job.id)
+    } catch (e) {
+      if (e instanceof ApiError && e.detail) onError(e.detail)
+      else onError(e instanceof Error ? e.message : 'Не удалось отменить проверку')
+    } finally {
+      setCancelling(false)
+    }
+  }
 
   const effectiveSelected = (resultIndex: number, edits: Edit[]): ReadonlySet<string> =>
     selection[resultIndex] ?? new Set(edits.map((e) => e.id))
@@ -254,14 +274,29 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
         <h2 className="text-base font-semibold text-zinc-100">
           Результаты проверки{' '}
           {job.status === 'running' && (
-            <span className="ml-2 inline-block animate-pulse text-sm font-normal text-sky-400">
-              выполняется…
-            </span>
+            <>
+              <span className="ml-2 inline-block animate-pulse text-sm font-normal text-sky-400">
+                выполняется…
+              </span>
+              <span className="ml-2 text-sm font-normal text-zinc-400">
+                Готово {doneCount} из {job.results.length}
+              </span>
+            </>
           )}
           {job.status === 'error' && (
             <span className="ml-2 text-sm font-normal text-red-400">завершилась с ошибкой</span>
           )}
         </h2>
+        {job.status === 'running' && (
+          <button
+            type="button"
+            onClick={() => void handleCancel()}
+            disabled={cancelling}
+            className="cursor-pointer rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {cancelling ? 'Отменяется…' : 'Отменить'}
+          </button>
+        )}
       </div>
 
       {done && (
@@ -325,10 +360,10 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
           <tbody className="divide-y divide-zinc-800">
             {job.results.map((r, resultIndex) => {
               const st = STATUS_META[r.status]
-              const isSelected = selected === r.filename
+              const isSelected = selected === resultIndex
               return (
                 <tr
-                  key={r.filename}
+                  key={resultIndex}
                   className={isSelected ? 'bg-sky-500/5' : 'hover:bg-zinc-900/50'}
                 >
                   <td className="max-w-64 truncate px-4 py-2.5 text-zinc-200" title={r.filename}>
@@ -356,7 +391,7 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
                     {r.report ? (
                       <button
                         type="button"
-                        onClick={() => setSelected(isSelected ? null : r.filename)}
+                        onClick={() => setSelected(isSelected ? null : resultIndex)}
                         className="cursor-pointer rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-1 text-xs font-medium text-zinc-100 transition-colors hover:bg-zinc-700"
                       >
                         {isSelected ? 'Скрыть' : 'Отчёт'}
@@ -389,6 +424,11 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
               </svg>
             </button>
           </div>
+          {selectedResult.textTruncated && (
+            <p className="mb-3 text-xs text-zinc-500">
+              Текст ДИ слишком длинный — проверка выполнена по первым ~120 000 символов.
+            </p>
+          )}
           <article className="md-report overflow-x-auto">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{selectedResult.report}</ReactMarkdown>
           </article>
