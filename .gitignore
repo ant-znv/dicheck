@@ -4,6 +4,11 @@ __pycache__/
 frontend/node_modules/
 frontend/dist/
 
+# сборка portable-версии
+build/
+/dist/
+DI_Check_portable.zip
+
 # локальные тестовые артефакты
 test-*.docx
 backend/testdata/last_*

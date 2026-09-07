@@ -14,8 +14,9 @@ DI_Check — локальное веб-приложение для провер�
   - `default_prompt.md` — системный промт по умолчанию (из `analiz-DI-goskontrakt-v4.docx`, раздел «2. Промт для ИИ»).
 - `frontend/` — React 19 + TypeScript + Vite 7 + Tailwind CSS v4; сборка в `frontend/dist`, раздаётся бэкендом как статика.
 - `backend/testdata/` — тестовые ДИ (`sample_di.docx`, генератор `make_sample.py`; доп. вариации — `make_samples_batch.py`), примеры отчётов, сквозной тест `verify_batch.py` (check → export docx → fix-all, нужен запущенный сервер и API-ключ).
-- `requirements.txt` — зависимости бэкенда, ставятся в `.venv` в корне; `requirements.lock.txt` — зафиксированные версии (`pip freeze`).
+- `requirements.txt` — зависимости бэкенда, ставятся в `.venv` в корне; `requirements.lock.txt` — зафиксированные версии (`pip freeze`); `requirements-dev.txt` — pytest и pyinstaller.
 - `backend/tests/` — pytest-сьют бэкенда (LLM мокается, сеть/ключи/Word/Tesseract не нужны); запуск из корня проекта.
+- `run.py` + `DI_Check.spec` + `build_exe.bat` — портативная сборка (PyInstaller onedir): exe со встроенными фронтендом и промтом; `build_exe.bat` собирает `dist\DI_Check\` и `DI_Check_portable.zip`. В frozen-режиме ресурсы берутся из `sys._MEIPASS` (см. FRONTEND_DIST в main.py).
 
 ## Команды
 
@@ -24,6 +25,7 @@ DI_Check — локальное веб-приложение для провер�
 - Тесты бэкенда: `.venv/Scripts/python.exe -X utf8 -m pytest backend/tests -q`
 - Фронтенд dev (прокси на 8787): `cd frontend && npm run dev`
 - Фронтенд сборка: `cd frontend && npm run build`
+- Сборка портативного exe: `build_exe.bat` (или `.venv/Scripts/python.exe -m PyInstaller --noconfirm --clean DI_Check.spec`)
 - Python в консоли Windows: вывод русского текста только в файл с `encoding='utf-8'` (консоль cp1251 падает на `print`); либо `python -X utf8`.
 
 ## Правила

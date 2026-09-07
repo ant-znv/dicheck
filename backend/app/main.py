@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import re
+import sys
 import time
 import uuid
 import zipfile
@@ -58,7 +59,11 @@ MAX_TEXT_CHARS = 120_000          # предел текста ДИ в user-messa
 JOB_TTL_SECONDS = 24 * 3600       # сколько жить завершённой джобе
 MAX_JOBS = 50                     # максимум джоб в памяти
 
-FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if getattr(sys, "frozen", False):
+    # PyInstaller: ресурсы распакованы в sys._MEIPASS (в onedir — каталог _internal)
+    FRONTEND_DIST = Path(sys._MEIPASS) / "frontend" / "dist"
+else:
+    FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 
 
 # ---------- Модели запросов ----------
