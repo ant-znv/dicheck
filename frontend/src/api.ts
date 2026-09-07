@@ -63,6 +63,98 @@ export interface FixAllItem {
   editIds: string[]
 }
 
+// --- История проверок ---
+
+export type HistoryOrigin = 'check' | 'fix'
+
+export interface HistoryLastCheck {
+  verdict: Verdict
+  checkedAt: string
+  findingsCount: number
+}
+
+/** Элемент списка документов истории (GET /api/history/documents). */
+export interface HistoryDocumentSummary {
+  id: number
+  title: string
+  position: string
+  department: string
+  notes: string
+  createdAt: string
+  updatedAt: string
+  versionsCount: number
+  fixedCount: number
+  lastCheck: HistoryLastCheck | null
+}
+
+/** Версия документа в карточке документа. */
+export interface HistoryDocumentVersion {
+  id: number
+  origin: HistoryOrigin
+  filename: string
+  createdAt: string
+  verdict: string | null
+  findingsCount: number
+  fixMethod: string | null
+  appliedEditIds: string[]
+  parentVersionId: number | null
+  jobId: string | null
+}
+
+/** Карточка документа (GET /api/history/documents/{id}). */
+export interface HistoryDocument {
+  id: number
+  title: string
+  position: string
+  department: string
+  notes: string
+  createdAt: string
+  updatedAt: string
+  versions: HistoryDocumentVersion[]
+}
+
+/** Замечание из детализации версии. */
+export interface HistoryFinding {
+  editId: string
+  title: string
+  original: string
+  replacement: string
+  reason: string
+}
+
+/** Детализация версии (GET /api/history/versions/{id}). */
+export interface HistoryVersionDetail {
+  id: number
+  documentId: number
+  origin: HistoryOrigin
+  filename: string
+  createdAt: string
+  verdict: string | null
+  fixMethod: string | null
+  appliedEditIds: string[]
+  parentVersionId: number | null
+  jobId: string | null
+  text: string
+  textTruncated: boolean
+  report: string | null
+  findings: HistoryFinding[]
+}
+
+export interface HistoryPatchPayload {
+  position?: string
+  department?: string
+  title?: string
+  notes?: string
+}
+
+/** Результат автозаполнения метаданных одного документа (массовый режим). */
+export interface HistoryExtractResult {
+  documentId: number
+  position: string
+  department: string
+  error: string | null
+}
+
 export class ApiError extends Error {
   status: number
   detail: string | null
@@ -211,4 +303,45 @@ export const api = {
 
   exportBlob: (jobId: string, format: 'md' | 'html' | 'docx') =>
     requestBlob(`/api/jobs/${jobId}/export?format=${format}`),
+
+  // --- История проверок ---
+
+  listHistoryDocuments: (params: { search?: string; limit?: number; offset?: number }) => {
+    const q = new URLSearchParams()
+    if (params.search) q.set('search', params.search)
+    q.set('limit', String(params.limit ?? 100))
+    q.set('offset', String(params.offset ?? 0))
+    return request<{ total: number; items: HistoryDocumentSummary[] }>(
+      `/api/history/documents?${q.toString()}`,
+    )
+  },
+
+  getHistoryDocument: (id: number) => request<HistoryDocument>(`/api/history/documents/${id}`),
+
+  getHistoryVersion: (id: number) => request<HistoryVersionDetail>(`/api/history/versions/${id}`),
+
+  downloadHistoryVersion: (id: number) => requestBlob(`/api/history/versions/${id}/download`),
+
+  patchHistoryDocument: (id: number, body: HistoryPatchPayload) =>
+    request<HistoryDocumentSummary>(`/api/history/documents/${id}`, jsonInit('PATCH', body)),
+
+  deleteHistoryDocument: (id: number) =>
+    request<{ ok: boolean }>(`/api/history/documents/${id}`, { method: 'DELETE' }),
+
+  extractHistoryDocumentMeta: (id: number) =>
+    request<{ position: string; department: string }>(
+      `/api/history/documents/${id}/extract-meta`,
+      { method: 'POST' },
+    ),
+
+  extractHistoryMetaBulk: (documentIds: number[] | null) =>
+    request<{ results: HistoryExtractResult[] }>(
+      '/api/history/extract-meta',
+      jsonInit('POST', { documentIds }),
+    ),
+
+  exportHistoryFixed: (documentIds?: number[]) =>
+    requestBlob(
+      `/api/history/export/fixed${documentIds ? `?documentIds=${documentIds.join(',')}` : ''}`,
+    ),
 }

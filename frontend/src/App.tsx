@@ -3,9 +3,12 @@ import { api, ApiError, formatError, type Job, type Settings, type UpdateInfo } 
 import SettingsPanel from './components/SettingsPanel'
 import CheckPanel, { type CheckContext } from './components/CheckPanel'
 import Results from './components/Results'
+import HistoryView from './components/HistoryView'
 import Toast, { type ToastData } from './components/Toast'
 
 const JOB_ID_KEY = 'di_check_job_id'
+
+type View = 'check' | 'history'
 
 function Spinner() {
   return (
@@ -25,6 +28,7 @@ function Spinner() {
 }
 
 export default function App() {
+  const [view, setView] = useState<View>('check')
   const [settings, setSettings] = useState<Settings | null>(null)
   const [settingsError, setSettingsError] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -66,6 +70,7 @@ export default function App() {
   useEffect(() => stopPolling, [stopPolling])
 
   const showError = useCallback((msg: string) => setToast({ type: 'error', text: msg }), [])
+  const showSuccess = useCallback((msg: string) => setToast({ type: 'success', text: msg }), [])
 
   // Поллинг статуса джобы: одиночные сбои сети переживаем молча,
   // останавливаемся после 3 неудач подряд — тогда показываем баннер с «Возобновить».
@@ -183,6 +188,34 @@ export default function App() {
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 py-4">
         <h1 className="text-lg font-bold text-zinc-50">Проверка должностных инструкций</h1>
         <div className="flex items-center gap-3">
+          {/* Переключатель разделов: Проверка / История */}
+          <div
+            role="tablist"
+            aria-label="Разделы"
+            className="flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-900 p-1"
+          >
+            {(
+              [
+                ['check', 'Проверка'],
+                ['history', 'История'],
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                role="tab"
+                aria-selected={view === key}
+                onClick={() => setView(key)}
+                className={`cursor-pointer rounded-md px-3 py-1 text-sm font-medium transition-colors ${
+                  view === key
+                    ? 'bg-sky-600 text-white'
+                    : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           {settings && (
             <span className="rounded-full border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-300">
               {activeProvider?.name ?? settings.activeProvider}
@@ -264,29 +297,35 @@ export default function App() {
 
         {/* Основная зона */}
         <main className="min-w-0 flex-1 space-y-6">
-          <CheckPanel
-            starting={starting}
-            checking={job?.status === 'running'}
-            onStart={(files, ctx) => void startCheck(files, ctx)}
-            onRejected={(message) => setToast({ type: 'error', text: message })}
-          />
-          {/* Баннер: поллинг остановлен после сетевых сбоев */}
-          {job && pollingStopped && job.status === 'running' && (
-            <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-500/50 bg-amber-950/60 px-4 py-3">
-              <span className="flex-1 text-sm text-amber-200">
-                Связь с сервером потеряна — статус проверки не обновляется. Возобновите наблюдение,
-                чтобы получить результат.
-              </span>
-              <button
-                type="button"
-                onClick={() => void startPolling(job.id)}
-                className="cursor-pointer rounded-lg bg-amber-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-amber-500"
-              >
-                Возобновить
-              </button>
-            </div>
+          {view === 'history' ? (
+            <HistoryView onError={showError} onSuccess={showSuccess} />
+          ) : (
+            <>
+              <CheckPanel
+                starting={starting}
+                checking={job?.status === 'running'}
+                onStart={(files, ctx) => void startCheck(files, ctx)}
+                onRejected={(message) => setToast({ type: 'error', text: message })}
+              />
+              {/* Баннер: поллинг остановлен после сетевых сбоев */}
+              {job && pollingStopped && job.status === 'running' && (
+                <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-500/50 bg-amber-950/60 px-4 py-3">
+                  <span className="flex-1 text-sm text-amber-200">
+                    Связь с сервером потеряна — статус проверки не обновляется. Возобновите
+                    наблюдение, чтобы получить результат.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void startPolling(job.id)}
+                    className="cursor-pointer rounded-lg bg-amber-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-amber-500"
+                  >
+                    Возобновить
+                  </button>
+                </div>
+              )}
+              {job && <Results key={job.id} job={job} onError={showError} />}
+            </>
           )}
-          {job && <Results key={job.id} job={job} onError={showError} />}
         </main>
       </div>
 
