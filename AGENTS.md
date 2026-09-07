@@ -11,7 +11,7 @@ DI_Check — локальное веб-приложение для провер�
   - `extractors.py` — извлечение текста из .docx/.doc/.pdf/.txt/.md/.odt;
   - `llm.py` — OpenAI-совместимый async-клиент (httpx);
   - `settings.py` — конфиг в `%APPDATA%\DI_Check\config.json`, API-ключи шифруются DPAPI;
-  - `default_prompt.md` — системный промт по умолчанию (из `analiz-DI-goskontrakt-v4.docx`, раздел «2. Промт для ИИ»).
+  - `default_prompt.md` — системный промт по умолчанию (первоисточник — методичка `analiz-DI-goskontrakt-v4.docx`, раздел «2. Промт для ИИ»; сам файл в репо не хранится).
 - `frontend/` — React 19 + TypeScript + Vite 7 + Tailwind CSS v4; сборка в `frontend/dist`, раздаётся бэкендом как статика.
 - `backend/testdata/` — генераторы тестовых ДИ (`make_sample.py`, `make_samples_batch.py`) и сквозной тест `verify_batch.py` (check → export docx → fix-all, нужен запущенный сервер и API-ключ). Сами `.docx`/отчёты в репо не хранятся (`.gitignore`: любые `*.docx` кроме `analiz-DI-goskontrakt-v4.docx`) — при необходимости сгенерировать: `python backend/testdata/make_sample.py`.
 - `requirements.txt` — зависимости бэкенда, ставятся в `.venv` в корне; `requirements.lock.txt` — зафиксированные версии (`pip freeze`); `requirements-dev.txt` — pytest и pyinstaller.
