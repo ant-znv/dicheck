@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import html as html_mod
 import io
 import json
@@ -16,6 +17,7 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from docx import Document
+from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -140,6 +142,10 @@ class DocumentPatch(BaseModel):
 
 
 class ExtractMetaBatchRequest(BaseModel):
+    documentIds: list[int] | None = None
+
+
+class OverlapsRequest(BaseModel):
     documentIds: list[int] | None = None
 
 
@@ -1517,8 +1523,463 @@ async def history_extract_meta_batch(body: ExtractMetaBatchRequest):
     return {"results": list(results)}
 
 
+# ---------- Обязанности и пересечения (Ф1) ----------
+
+DUTIES_SYSTEM_PROMPT = (
+    "Извлеки из текста должностной инструкции список конкретных должностных обязанностей "
+    '(разделы "Обязанности"/"Функции"/"Должностные обязанности"). '
+    'Пропускай общие формулы ("соблюдает трудовую дисциплину", "выполняет приказы руководителя"). '
+    'Верни только JSON без markdown: {"duties": ["обязанность 1", "обязанность 2"]}. '
+    "Не больше 40 пунктов, каждый — одна фраза до 200 символов."
+)
+DUTIES_TEXT_LIMIT = 60_000  # символов текста ДИ, уходящих в user-message extract-duties
+DUTIES_MAX_COUNT = 40       # cap на число обязанностей (валидация ответа модели)
+DUTIES_MAX_LEN = 300        # cap на длину одной обязанности (валидация ответа модели)
+
+OVERLAPS_SYSTEM_PROMPT = (
+    "Ты находишь пересечения должностных обязанностей между сотрудниками РАЗНЫХ подразделений. "
+    "Тебе даны документы: подразделение, должность, список обязанностей. "
+    "Найди содержательные пересечения — одну и ту же фактическую работу, закреплённую за "
+    "разными людьми/подразделениями (дублирование зон ответственности). "
+    'НЕ включай общие формулировки и очевидные управленческие связи "подчинённый-руководитель" '
+    "внутри одного подразделения. Пересечения ищи ТОЛЬКО между разными подразделениями. "
+    "Верни только JSON без markdown: "
+    '{"groups": [{"duty": "суть пересечения одной фразой", '
+    '"comment": "кратко почему это проблема/что уточнить", '
+    '"items": [{"documentId": 123, "duty": "формулировка из документа"}]}]}. '
+    'Если пересечений нет — {"groups": []}. documentId указывай точно как дано.'
+)
+OVERLAP_CHUNK_SIZE = 8       # документов на один LLM-вызов сравнения
+OVERLAP_LLM_CONCURRENCY = 2  # параллельных LLM-вызовов (извлечение и сравнение)
+
+
+def _parse_json_object(raw: str) -> dict | None:
+    """json.loads с fallback на brace-matching от первого '{'; иначе None."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        idx = raw.find("{")
+        if idx == -1:
+            return None
+        end = _matching_brace(raw, idx)
+        if end == -1:
+            return None
+        try:
+            data = json.loads(raw[idx:end])
+        except json.JSONDecodeError:
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def _parse_duties_response(raw: str) -> list[str]:
+    """Разбирает ответ модели в {"duties": [...]}; иначе llm.LLMError."""
+    data = _parse_json_object(raw)
+    if data is None or not isinstance(data.get("duties"), list):
+        raise llm.LLMError("invalid_duties_response")
+    duties: list[str] = []
+    for item in data["duties"]:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text:
+            duties.append(text[:DUTIES_MAX_LEN])
+    if not duties:
+        raise llm.LLMError("invalid_duties_response")
+    return duties[:DUTIES_MAX_COUNT]
+
+
+async def _duties_via_llm(document_id: int, version_id: int, text: str) -> list[str]:
+    """Один LLM-вызов извлечения обязанностей + сохранение в БД."""
+    state = settings.get_settings_state()
+    raw = await llm.chat_completion(
+        state["activeProvider"],
+        state["activeModel"],
+        DUTIES_SYSTEM_PROMPT,
+        text[:DUTIES_TEXT_LIMIT],
+    )
+    duties = _parse_duties_response(raw)
+    history.set_duties(document_id, duties, version_id)
+    return duties
+
+
+async def _extract_duties_for_document(document_id: int) -> tuple[list[str], int]:
+    """LLM-извлечение обязанностей + запись в документ (для endpoint'а).
+
+    HTTPException — нет документа/текста; llm.LLMError — сбой вызова/ответа.
+    """
+    if history.get_document(document_id) is None:
+        raise HTTPException(status_code=404, detail="document_not_found")
+    check = history.latest_check_version(document_id)
+    if check is None:
+        raise HTTPException(status_code=409, detail="no_text")
+    duties = await _duties_via_llm(document_id, *check)
+    return duties, check[0]
+
+
+@app.post("/api/history/documents/{document_id}/extract-duties")
+async def history_extract_duties(document_id: int):
+    try:
+        duties, _version_id = await _extract_duties_for_document(document_id)
+    except llm.LLMError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"documentId": document_id, "count": len(duties), "duties": duties}
+
+
+def _parse_overlap_response(raw: str, chunk: list[dict]) -> list[dict]:
+    """Разбирает ответ сравнения одного чанка.
+
+    Оставляет только items с documentId из чанка; группы с менее чем двумя
+    валидными items из РАЗНЫХ подразделений выбрасываются.
+    """
+    data = _parse_json_object(raw)
+    if data is None or not isinstance(data.get("groups"), list):
+        raise llm.LLMError("invalid_overlap_response")
+    by_id = {e["documentId"]: e for e in chunk}
+    groups: list[dict] = []
+    for raw_group in data["groups"]:
+        if not isinstance(raw_group, dict) or not isinstance(raw_group.get("items"), list):
+            continue
+        items = []
+        for it in raw_group["items"]:
+            if not isinstance(it, dict):
+                continue
+            doc_id = it.get("documentId")
+            if not isinstance(doc_id, int) or doc_id not in by_id:
+                continue  # documentId вне чанка / не число
+            entry = by_id[doc_id]
+            duty = it.get("duty")
+            items.append({
+                "documentId": doc_id,
+                "position": entry["position"],
+                "department": entry["department"],
+                "duty": duty.strip() if isinstance(duty, str) else "",
+            })
+        departments = {(by_id[i["documentId"]]["department"] or "") for i in items}
+        if len(items) < 2 or len(departments) < 2:
+            continue
+        groups.append({
+            "duty": str(raw_group.get("duty") or "").strip(),
+            "comment": str(raw_group.get("comment") or "").strip(),
+            "items": items,
+        })
+    return groups
+
+
+def _overlap_chunk_message(chunk: list[dict]) -> str:
+    """user-message сравнения: перечисление документов с их обязанностями."""
+    parts = []
+    for e in chunk:
+        lines = "\n".join(f"- {d}" for d in e["duties"][:DUTIES_MAX_COUNT])
+        parts.append(
+            f"### Документ {e['documentId']} — подразделение:"
+            f" {e['department'] or '(не указано)'} — должность:"
+            f" {e['position'] or '(не указано)'}\n{lines}"
+        )
+    return "\n\n".join(parts)
+
+
+def _overlap_report_response(record: dict) -> dict:
+    """Единая форма ответа overlaps (POST и GET): id + createdAt + результат."""
+    return {"id": record["id"], "createdAt": record["created_at"], **record["result"]}
+
+
+@app.post("/api/history/overlaps")
+async def history_overlaps(body: OverlapsRequest):
+    # documentIds null — все документы; иначе список (дубликаты схлопываем)
+    if body.documentIds is None:
+        ids = history.all_document_ids()
+    else:
+        ids = list(dict.fromkeys(body.documentIds))
+    if not ids:
+        raise HTTPException(status_code=400, detail="no_documents")
+
+    docs: dict[int, dict] = {}
+    for doc_id in ids:
+        doc = history.get_document(doc_id)
+        if doc is not None:
+            docs[doc_id] = doc
+
+    # 1. Гарантируем обязанности каждому документу: кэш, иначе LLM-извлечение
+    sem = asyncio.Semaphore(OVERLAP_LLM_CONCURRENCY)
+
+    async def ensure(duties_id: int) -> tuple[int, list[str] | None, str | None]:
+        if duties_id not in docs:
+            return duties_id, None, "document_not_found"
+        duties, vid, _ts = history.get_duties(duties_id)
+        check = history.latest_check_version(duties_id)
+        if duties and check is not None and vid == check[0]:
+            return duties_id, duties, None  # кэш актуален
+        if check is None:
+            return duties_id, None, "no_text"
+        try:
+            async with sem:
+                duties = await _duties_via_llm(duties_id, *check)
+            return duties_id, duties, None
+        except llm.LLMError as e:
+            return duties_id, None, f"извлечение не удалось: {e}"
+        except Exception as e:
+            return duties_id, None, f"извлечение не удалось: {e}"
+
+    outcomes = await asyncio.gather(*(ensure(i) for i in ids))
+    entries: list[dict] = []
+    skipped: list[dict] = []
+    for doc_id, duties, error in outcomes:
+        doc = docs.get(doc_id) or {}
+        base = {
+            "documentId": doc_id,
+            "position": doc.get("position") or "",
+            "department": doc.get("department") or "",
+        }
+        if error:
+            skipped.append({**base, "error": error})
+        else:
+            entries.append({**base, "duties": duties or []})
+
+    # 2. Сравнение чанками по ≤8 документов: один LLM-вызов на чанк
+    chunks = [
+        entries[i : i + OVERLAP_CHUNK_SIZE]
+        for i in range(0, len(entries), OVERLAP_CHUNK_SIZE)
+    ]
+    compare_sem = asyncio.Semaphore(OVERLAP_LLM_CONCURRENCY)
+
+    async def compare(chunk: list[dict]) -> list[dict]:
+        state = settings.get_settings_state()
+        async with compare_sem:
+            raw = await llm.chat_completion(
+                state["activeProvider"],
+                state["activeModel"],
+                OVERLAPS_SYSTEM_PROMPT,
+                _overlap_chunk_message(chunk),
+            )
+        return _parse_overlap_response(raw, chunk)
+
+    groups: list[dict] = []
+    if chunks:
+        for part in await asyncio.gather(*(compare(c) for c in chunks)):
+            groups.extend(part)
+
+    result = {
+        "documents": [
+            {
+                "documentId": e["documentId"],
+                "position": e["position"],
+                "department": e["department"],
+                "dutiesCount": len(e["duties"]),
+            }
+            for e in entries
+        ],
+        "groups": groups,
+        "skipped": skipped,
+    }
+    history.save_overlap_report([e["documentId"] for e in entries], result)
+    return _overlap_report_response(history.latest_overlap_report())
+
+
+@app.get("/api/history/overlaps")
+async def history_overlaps_get():
+    record = history.latest_overlap_report()
+    if record is None:
+        raise HTTPException(status_code=404, detail="no_report")
+    return _overlap_report_response(record)
+
+
+# ---------- Шаблон отчёта и сборка docx (Ф2, без LLM) ----------
+
+TEMPLATE_KEYS = ("ДОЛЖНОСТЬ", "ПОДРАЗДЕЛЕНИЕ", "НАЗВАНИЕ", "ТЕКСТ", "ДАТА", "ЗАМЕТКИ")
+_TEMPLATE_MAGIC = b"PK\x03\x04"
+
+
+def _iter_template_paragraphs(doc: Document):
+    """Абзацы шаблона: тело документа и таблицы (включая вложенные)."""
+    yield from doc.paragraphs
+    for table in doc.tables:
+        yield from _iter_table_paragraphs(table)
+
+
+def _template_keys(doc: Document) -> list[str]:
+    """Ключи TEMPLATE_KEYS, встречающиеся в шаблоне ({{КЛЮЧ}})."""
+    found = []
+    for key in TEMPLATE_KEYS:
+        marker = "{{" + key + "}}"
+        for par in _iter_template_paragraphs(doc):
+            if marker in "".join(r.text for r in par.runs):
+                found.append(key)
+                break
+    return found
+
+
+@app.put("/api/history/template")
+async def history_template_put(request: Request):
+    """Загрузка шаблона: тело запроса — сырые байты .docx (octet-stream)."""
+    data = await request.body()
+    if not data.startswith(_TEMPLATE_MAGIC):
+        raise HTTPException(status_code=400, detail="invalid_template")
+    try:
+        doc = Document(io.BytesIO(data))
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_template")
+    history.save_template(data)
+    return {"ok": True, "size": len(data), "keys": _template_keys(doc)}
+
+
+@app.get("/api/history/template")
+async def history_template_get():
+    data = history.get_template()
+    if data is None:
+        return {"exists": False}
+    try:
+        keys = _template_keys(Document(io.BytesIO(data)))
+    except Exception:
+        keys = []
+    return {"exists": True, "size": len(data), "keys": keys}
+
+
+@app.delete("/api/history/template")
+async def history_template_delete():
+    history.delete_template()
+    return {"ok": True}
+
+
+def _set_paragraph_text(par: Paragraph, new_text: str) -> None:
+    """Перезаписывает текст абзаца с сохранением форматирования.
+
+    Текст кладётся в первый непустой run (его форматирование распространяется
+    на всё значение), остальные run'ы очищаются.
+    """
+    target = None
+    for r in par.runs:
+        if target is None and r.text:
+            target = r
+        else:
+            r.text = ""
+    if target is None:
+        target = par.runs[0] if par.runs else par.add_run("")
+    target.text = new_text
+
+
+def _insert_body_after_anchor(
+    anchor: Paragraph, body_docx_bytes: bytes | None, text: str
+) -> None:
+    """Заменяет якорный абзац {{ТЕКСТ}} содержимым исправленного docx.
+
+    Если body_docx_bytes передан и открывается — его тело (кроме sectPr)
+    вставляется после якоря, сам якорь удаляется; иначе текст вставляется
+    построчно абзацами со стилем якоря.
+    """
+    body_doc = None
+    if body_docx_bytes:
+        try:
+            body_doc = Document(io.BytesIO(body_docx_bytes))
+        except Exception as e:
+            logger.warning("Шаблонная сборка: тело не открылось, вставляю текст: %s", e)
+    if body_doc is not None:
+        cursor = anchor._p
+        for child in list(body_doc.element.body):
+            if child.tag == qn("w:sectPr"):
+                continue
+            new_el = copy.deepcopy(child)
+            cursor.addnext(new_el)
+            cursor = new_el
+    else:
+        for line in (text or "").splitlines():
+            anchor.insert_paragraph_before(line, style=anchor.style)
+    anchor._p.getparent().remove(anchor._p)
+
+
+def assemble_from_template(
+    template_bytes: bytes,
+    position: str = "",
+    department: str = "",
+    title: str = "",
+    notes: str = "",
+    body_docx_bytes: bytes | None = None,
+    text: str = "",
+) -> bytes:
+    """Детерминированная сборка docx из шаблона с плейсхолдерами {{КЛЮЧ}} (без LLM).
+
+    Простые ключи заменяются по всему тексту абзаца (тело + таблицы) с
+    сохранением форматирования; {{ДАТА}} — текущая дата ДД.ММ.ГГГГ; абзац с
+    {{ТЕКСТ}} заменяется содержимым body_docx_bytes либо построчным текстом.
+    """
+    doc = Document(io.BytesIO(template_bytes))
+    values = {
+        "ДОЛЖНОСТЬ": position,
+        "ПОДРАЗДЕЛЕНИЕ": department,
+        "НАЗВАНИЕ": title,
+        "ЗАМЕТКИ": notes,
+        "ДАТА": datetime.now().strftime("%d.%m.%Y"),
+    }
+    anchor = None
+    for par in _iter_template_paragraphs(doc):
+        joined = "".join(r.text for r in par.runs)
+        if "{{" not in joined:
+            continue
+        if "{{ТЕКСТ}}" in joined:
+            if anchor is None:
+                anchor = par  # содержимое вставляется в первый якорь
+            else:
+                _set_paragraph_text(par, joined.replace("{{ТЕКСТ}}", ""))
+            continue
+        new_text = joined
+        for key, value in values.items():
+            new_text = new_text.replace("{{" + key + "}}", value)
+        if new_text != joined:
+            _set_paragraph_text(par, new_text)
+    if anchor is not None:
+        _insert_body_after_anchor(anchor, body_docx_bytes, text)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+_FILENAME_BAD_RE = re.compile(r'[\\/:*?"<>|\r\n]+')
+
+
+def _safe_arc_stem(name: str) -> str:
+    """Безопасное имя для архива: запрещённые в Windows символы → '_'."""
+    cleaned = _FILENAME_BAD_RE.sub("_", (name or "")).strip(" .")
+    return cleaned or "Документ"
+
+
+async def _export_fixed_with_template(ids: list[int] | None) -> Response:
+    """ZIP с исправленными ДИ, собранными из пользовательского шаблона."""
+    template_bytes = history.get_template()
+    if template_bytes is None:
+        raise HTTPException(status_code=409, detail="no_template")
+    details = history.latest_fixed_details(ids)
+    if not details:
+        raise HTTPException(status_code=404, detail="no_fixed_files")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        used: set[str] = set()
+        for d in details:
+            data = await asyncio.to_thread(
+                assemble_from_template,
+                template_bytes,
+                d["position"],
+                d["department"],
+                d["document_title"],
+                d["notes"],
+                d["file_bytes"],
+                d["text"],
+            )
+            stem = _safe_arc_stem(d["position"] or d["document_title"])
+            name = f"{stem}_исправленная.docx"
+            n = 2
+            while name in used:  # коллизии имён — как в /fix-all
+                name = f"{stem}_исправленная_{n}.docx"
+                n += 1
+            used.add(name)
+            zf.writestr(name, data)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="ispravlennye_di.zip"'},
+    )
+
+
 @app.get("/api/history/export/fixed")
-async def history_export_fixed(documentIds: str = ""):
+async def history_export_fixed(documentIds: str = "", template: bool = False):
     raw = (documentIds or "").strip()
     ids: list[int] | None
     if raw:
@@ -1528,6 +1989,8 @@ async def history_export_fixed(documentIds: str = ""):
             raise HTTPException(status_code=400, detail="invalid_document_ids")
     else:
         ids = None
+    if template:
+        return await _export_fixed_with_template(ids)
     files = history.latest_fixed_versions(ids)
     if not files:
         raise HTTPException(status_code=404, detail="no_fixed_files")

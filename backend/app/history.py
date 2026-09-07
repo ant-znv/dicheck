@@ -76,7 +76,21 @@ CREATE TABLE IF NOT EXISTS findings (
     UNIQUE (version_id, edit_id)
 );
 CREATE INDEX IF NOT EXISTS ix_findings_version ON findings(version_id);
+CREATE TABLE IF NOT EXISTS overlap_reports (
+    id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    document_ids_json TEXT NOT NULL DEFAULT '[]',
+    result_json TEXT NOT NULL DEFAULT '{}'
+);
 """
+
+# Колонки documents, добавляемые миграцией (БД версии до фичи «пересечения» их
+# не содержат); миграция не деструктивная — только ALTER TABLE ADD COLUMN.
+_MIGRATION_COLUMNS = (
+    ("duties_json", "TEXT"),          # JSON-массив строк обязанностей
+    ("duties_version_id", "INTEGER"),  # версия, из которой обязанности извлечены
+    ("duties_extracted_at", "TEXT"),
+)
 
 # Поля documents, доступные для обновления (update_document/extract_meta_update).
 _META_FIELDS = ("position", "department", "title", "notes")
@@ -117,6 +131,14 @@ def _uclower(value: object) -> object:
     return value.lower() if isinstance(value, str) else value
 
 
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Дописывает duties-колонки в documents старым БД (данные не трогаются)."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+    for name, decl in _MIGRATION_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE documents ADD COLUMN {name} {decl}")
+
+
 def _ensure_schema(conn: sqlite3.Connection, path: Path) -> None:
     key = str(path)
     if key in _schema_ready:
@@ -125,6 +147,7 @@ def _ensure_schema(conn: sqlite3.Connection, path: Path) -> None:
         if key in _schema_ready:
             return
         conn.executescript(_SCHEMA)
+        _migrate_schema(conn)
         conn.commit()
         _schema_ready.add(key)
 
@@ -512,3 +535,211 @@ def extract_meta_update(
             return new_position, new_department
         finally:
             conn.close()
+
+
+# ---------- Обязанности (для поиска пересечений) ----------
+
+def latest_check_version(document_id: int) -> tuple[int, str] | None:
+    """(id, text) последней check-версии; None, если её нет или текст пуст."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, text FROM versions WHERE document_id = ? AND origin = 'check'"
+            " ORDER BY id DESC LIMIT 1",
+            (document_id,),
+        ).fetchone()
+        if row is None or not row["text"]:
+            return None
+        return int(row["id"]), row["text"]
+    finally:
+        conn.close()
+
+
+def all_document_ids() -> list[int]:
+    """Все id документов по порядку (для overlaps без documentIds)."""
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT id FROM documents ORDER BY id").fetchall()
+        return [int(r["id"]) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_duties(document_id: int, duties: list[str], version_id: int) -> None:
+    """Сохраняет извлечённые обязанности; пустой список старые не затирает."""
+    if not duties:
+        return
+    with _write_lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                "UPDATE documents SET duties_json = ?, duties_version_id = ?,"
+                " duties_extracted_at = ?, updated_at = ? WHERE id = ?",
+                (
+                    json.dumps(list(duties), ensure_ascii=False),
+                    int(version_id),
+                    _now(),
+                    _now(),
+                    document_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_duties(document_id: int) -> tuple[list[str] | None, int | None, str | None]:
+    """(duties | None, version_id, extracted_at); None, если обязанности не извлекались."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT duties_json, duties_version_id, duties_extracted_at"
+            " FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None or not row["duties_json"]:
+        return None, None, None
+    try:
+        duties = json.loads(row["duties_json"])
+    except json.JSONDecodeError:
+        return None, None, None
+    if not isinstance(duties, list):
+        return None, None, None
+    return [str(d) for d in duties], row["duties_version_id"], row["duties_extracted_at"]
+
+
+# ---------- Отчёты о пересечениях (хранятся последние 5) ----------
+
+OVERLAP_REPORTS_LIMIT = 5
+
+
+def save_overlap_report(document_ids: list[int], result: dict) -> int:
+    """Сохраняет отчёт о пересечениях; более старые сверх лимита удаляются."""
+    with _write_lock:
+        conn = _connect()
+        try:
+            cur = conn.execute(
+                "INSERT INTO overlap_reports(created_at, document_ids_json, result_json)"
+                " VALUES (?, ?, ?)",
+                (
+                    _now(),
+                    json.dumps([int(i) for i in document_ids or []]),
+                    json.dumps(result, ensure_ascii=False),
+                ),
+            )
+            report_id = int(cur.lastrowid)
+            conn.execute(
+                "DELETE FROM overlap_reports WHERE id NOT IN"
+                " (SELECT id FROM overlap_reports ORDER BY id DESC LIMIT ?)",
+                (OVERLAP_REPORTS_LIMIT,),
+            )
+            conn.commit()
+            return report_id
+        finally:
+            conn.close()
+
+
+def latest_overlap_report() -> dict | None:
+    """Последний отчёт с распарсенными JSON-полями; None, если отчётов нет."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM overlap_reports ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            result = json.loads(row["result_json"] or "{}")
+        except json.JSONDecodeError:
+            result = {}
+        try:
+            ids = json.loads(row["document_ids_json"] or "[]")
+        except json.JSONDecodeError:
+            ids = []
+        return {
+            "id": int(row["id"]),
+            "created_at": row["created_at"],
+            "document_ids": ids if isinstance(ids, list) else [],
+            "result": result if isinstance(result, dict) else {},
+        }
+    finally:
+        conn.close()
+
+
+# ---------- Шаблон отчёта (report_template.docx в конфиг-каталоге) ----------
+
+def template_path() -> Path:
+    """Путь файла шаблона; резолвится при каждом вызове (тесты уводят конфиг)."""
+    return Path(settings._CONFIG_DIR) / "report_template.docx"
+
+
+def save_template(data: bytes) -> None:
+    path = template_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def get_template() -> bytes | None:
+    """Байты шаблона; None, если файл не загружен."""
+    path = template_path()
+    if not path.is_file():
+        return None
+    return path.read_bytes()
+
+
+def delete_template() -> bool:
+    """Удаляет шаблон; отсутствие файла ошибкой не считается."""
+    try:
+        template_path().unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+# ---------- Данные последней fix-версии (для шаблонного экспорта) ----------
+
+def latest_fixed_details(document_ids: list[int] | None) -> list[dict]:
+    """Данные последней fix-версии каждого документа для сборки из шаблона.
+
+    document_ids=None — по всем документам; пустой список — пустой результат.
+    Поля: document_id, position, department, document_title, notes,
+    file_bytes, text, filename. Сортировка по document_id.
+    """
+    query = (
+        "SELECT v.document_id AS document_id,"
+        " d.position AS position, d.department AS department,"
+        " d.title AS document_title, d.notes AS notes,"
+        " v.file_bytes AS file_bytes, v.text AS text, v.filename AS filename"
+        " FROM versions v JOIN documents d ON d.id = v.document_id"
+        " WHERE v.origin = 'fix' AND v.id = ("
+        "   SELECT MAX(v2.id) FROM versions v2"
+        "   WHERE v2.document_id = v.document_id AND v2.origin = 'fix')"
+    )
+    params: list[object] = []
+    if document_ids is not None:
+        ids = [int(i) for i in document_ids]
+        if not ids:
+            return []
+        query += f" AND v.document_id IN ({','.join('?' * len(ids))})"
+        params = ids
+    query += " ORDER BY v.document_id ASC"
+    conn = _connect()
+    try:
+        rows = conn.execute(query, params).fetchall()
+        return [
+            {
+                "document_id": int(r["document_id"]),
+                "position": r["position"] or "",
+                "department": r["department"] or "",
+                "document_title": r["document_title"] or "",
+                "notes": r["notes"] or "",
+                "file_bytes": bytes(r["file_bytes"] or b""),
+                "text": r["text"] or "",
+                "filename": r["filename"] or "",
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
