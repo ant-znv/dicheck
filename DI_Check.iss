@@ -45,6 +45,14 @@ CloseApplications=yes
 Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; \
     GroupDescription: "Дополнительно:"
 
+; Перед копированием новых файлов чистим _internal: PyInstaller кладёт туда
+; все DLL/pyd и фронтенд (в т.ч. хэшированные ассеты Vite), которые от версии
+; к версии меняют имена — поверх старые копятся как мусор. _internal полностью
+; пересоздаётся установщиком (см. DI_Check.spec: onedir = DI_Check.exe +
+; _internal), а unins000.exe лежит рядом в {app} и не затрагивается.
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 Source: "dist\DI_Check\*"; DestDir: "{app}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs

@@ -5,7 +5,9 @@
 2. install() — скачать установщик (asset с точным именем SETUP_ASSET_NAME) во
    %TEMP%, проверить sha256 (если GitHub отдал digest), запустить setup /SILENT
    в фоне и НЕ ждать: логика «убить старое → поставить → запустить новое»
-   живёт в инсталляторе, а не здесь.
+   живёт в инсталляторе, а не здесь. Сетевые сбои заворачиваются в UpdateError
+   (endpoint отдаёт detail, а не 500); для портативной сборки (нет unins000.exe
+   рядом с exe) обновление через setup невозможно — UpdateError с подсказкой.
 3. При запуске setup окружение чистится от _PYI_*/PYINSTALLER_* — иначе
    PyInstaller-бутлоадер свежего exe падает с "Security validation failure".
 
@@ -20,6 +22,7 @@ import os
 import re
 import ssl
 import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.request
@@ -125,6 +128,24 @@ def sanitize_tag(tag: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", tag)
 
 
+def releases_url(repo: str) -> str:
+    """Страница релизов репозитория — для подсказок пользователю."""
+    return f"https://github.com/{repo}/releases"
+
+
+def _is_portable(exe_dir: Path | None = None) -> bool:
+    """Портативная ли сборка (распакованный ZIP без установки)?
+
+    Признак: frozen-процесс и НЕТ дефолтного деинсталлятора Inno Setup
+    (unins000.exe) рядом с exe — установщик всегда кладёт его рядом с
+    DI_Check.exe, портатив — нет. В dev-режиме (не frozen) — False.
+    """
+    if not getattr(sys, "frozen", False):
+        return False
+    directory = Path(exe_dir) if exe_dir is not None else Path(sys.executable).parent
+    return not (directory / "unins000.exe").exists()
+
+
 # ---------- API апдейтера ----------
 
 def _latest_release(
@@ -179,12 +200,31 @@ def install(
     download=_default_download,
     launch=_default_launch,
 ) -> dict:
-    """Скачать установщик и запустить его в фоне. Бросает UpdateError."""
+    """Скачать установщик и запустить его в фоне. Бросает UpdateError.
+
+    Любой сбой сети/данных (запрос релиза, скачивание, чтение файла для digest)
+    превращается в UpdateError — endpoint отдаёт его как detail, а не 500.
+    Для портативной сборки (ZIP без установки) автоматическое обновление
+    невозможно — UpdateError с подсказкой скачать новый ZIP вручную.
+    """
     repo = (repo or DEFAULT_REPO).strip()
     if not repo or "/" not in repo:
         raise UpdateError("Репозиторий обновлений не задан (настройки → Обновления)")
 
-    data = _latest_release(repo, token or None, fetch_json)
+    if _is_portable():
+        raise UpdateError(
+            "Это портативная версия — автоматическое обновление не поддерживается. "
+            f"Скачайте новый ZIP со страницы релизов ({releases_url(repo)}) "
+            "и замените папку вручную"
+        )
+
+    try:
+        data = _latest_release(repo, token or None, fetch_json)
+    except UpdateError:
+        raise
+    except Exception as e:
+        raise UpdateError(str(e)) from e
+
     tag = (data.get("tag_name") or "").strip()
     if parse_version(tag) <= parse_version(APP_VERSION):
         raise UpdateError("Обновление не требуется: установлена последняя версия")
@@ -207,13 +247,22 @@ def install(
     dest = str(Path(tempfile.gettempdir()) / filename)
 
     token_or_none = token or None
-    download(url, token_or_none, dest)
+    try:
+        download(url, token_or_none, dest)
+    except UpdateError:
+        raise
+    except Exception as e:
+        raise UpdateError(str(e)) from e
 
     # digest приходит как "sha256:<hex>" не для всех assets; нет поля — пропускаем.
     digest = asset.get("digest") or ""
     if digest.startswith("sha256:"):
         expected = digest.split(":", 1)[1].lower()
-        actual = hashlib.sha256(Path(dest).read_bytes()).hexdigest()
+        try:
+            actual = hashlib.sha256(Path(dest).read_bytes()).hexdigest()
+        except OSError as e:
+            Path(dest).unlink(missing_ok=True)
+            raise UpdateError(str(e)) from e
         if actual != expected:
             Path(dest).unlink(missing_ok=True)
             raise UpdateError("sha256 скачанного установщика не совпал — файл удалён")

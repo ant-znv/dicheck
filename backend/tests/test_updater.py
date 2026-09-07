@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -114,6 +116,125 @@ def test_check_network_error_is_error_string():
 
     info = check("owner/repo", None, fetch_json=fail)
     assert "no network" in info["error"]
+
+
+# ---------- install(): сетевые сбои → UpdateError (не сырые исключения) ----------
+
+def test_install_fetch_urlerror_becomes_update_error():
+    def fail(url, token):
+        raise urllib.error.URLError("name resolution failed")
+
+    with pytest.raises(UpdateError, match="name resolution failed"):
+        install(
+            "owner/repo",
+            None,
+            fetch_json=fail,
+            download=lambda *a: pytest.fail("no download"),
+            launch=lambda argv: pytest.fail("no launch"),
+        )
+
+
+def test_install_fetch_bad_json_becomes_update_error():
+    def fail(url, token):
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    with pytest.raises(UpdateError, match="Expecting value"):
+        install(
+            "owner/repo",
+            None,
+            fetch_json=fail,
+            download=lambda *a: pytest.fail("no download"),
+            launch=lambda argv: pytest.fail("no launch"),
+        )
+
+
+def test_install_download_oserror_becomes_update_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    def fail(url, token, dest):
+        raise OSError("disk full")
+
+    with pytest.raises(UpdateError, match="disk full"):
+        install(
+            "owner/repo",
+            None,
+            fetch_json=lambda url, token: _release("v9.9.9"),
+            download=fail,
+            launch=lambda argv: pytest.fail("no launch"),
+        )
+    # недокачанный файл не остаётся мусором в %TEMP%
+    assert list(tmp_path.glob("di-check-setup-*")) == []
+
+
+def test_install_digest_read_oserror_becomes_update_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    def fake_download(url, token, dest):
+        Path(dest).write_bytes(b"setup-bytes")
+
+    real_read_bytes = Path.read_bytes
+
+    def broken_read_bytes(self):
+        if self.name.startswith("di-check-setup-"):
+            raise OSError("unreadable file")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", broken_read_bytes)
+    with pytest.raises(UpdateError, match="unreadable file"):
+        install(
+            "owner/repo",
+            None,
+            fetch_json=lambda url, token: _release("v9.9.9", digest="sha256:" + "0" * 64),
+            download=fake_download,
+            launch=lambda argv: pytest.fail("no launch"),
+        )
+    assert list(tmp_path.glob("di-check-setup-*")) == []
+
+
+# ---------- портативная сборка: детект и запрет автообновления ----------
+
+def test_is_portable_no_uninstaller(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert updater._is_portable(tmp_path) is True
+
+
+def test_is_portable_with_inno_uninstaller(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    (tmp_path / "unins000.exe").write_bytes(b"")
+    assert updater._is_portable(tmp_path) is False
+
+
+def test_is_portable_false_in_dev(monkeypatch, tmp_path):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert updater._is_portable(tmp_path) is False
+
+
+def test_is_portable_default_dir_next_to_executable(monkeypatch):
+    """Без аргумента смотрим рядом с sys.executable (в тестах — venv, без unins000.exe)."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert updater._is_portable() is True
+
+
+def test_install_portable_raises_friendly_error(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    with pytest.raises(UpdateError) as exc_info:
+        install(
+            "owner/repo",
+            None,
+            fetch_json=lambda *a: pytest.fail("no fetch"),
+            download=lambda *a: pytest.fail("no download"),
+            launch=lambda argv: pytest.fail("no launch"),
+        )
+    message = str(exc_info.value)
+    assert "портативн" in message.lower()
+    assert "ZIP" in message
+    # ссылка на релизы строится по переданному репозиторию
+    assert "https://github.com/owner/repo/releases" in message
+
+
+def test_sanitize_tag_keeps_dots():
+    """Имя установщика сохраняет точки версии: di-check-setup-v0.2.2.exe."""
+    assert f"di-check-setup-{sanitize_tag('v0.2.2')}.exe" == "di-check-setup-v0.2.2.exe"
 
 
 # ---------- install() ----------
