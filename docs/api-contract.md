@@ -122,6 +122,82 @@ Body: `{ "items": [{ "resultIndex": 0, "editIds": ["e1", "e2"] }, ...] }` — п
 Ответ: 200, `Content-Type: application/zip`, `Content-Disposition: attachment; filename="ispravlennye_di.zip"`. В архиве: `<имя>_исправленная.docx` для каждого успешного item; если были неудачи — дополнительно `_errors.txt` со списком «файл: причина».
 Ошибки уровня запроса: 404 — нет джобы; 400 — пустой `items` или resultIndex вне диапазона; 410 — `payload_expired`, если исходные байты хотя бы одного файла уже выгружены из памяти (~1 ч после завершения проверки); 502 — если не удалось исправить ни одного файла.
 
+## История проверок
+
+Каждая проверка сохраняется автоматически (без участия фронтенда) в локальную SQLite-БД `%APPDATA%\DI_Check\history.db`: документ (метаданные), версии (`origin: "check"` — исходная проверка с байтами исходного файла, текстом и отчётом; `origin: "fix"` — исправленный .docx) и замечания (findings — те же правки, что в `edits` результата джобы). Ошибка БД никогда не ломает проверку/фикс — только запись в лог. Данные переживают перезапуск сервера; удаляются вместе с `%APPDATA%\DI_Check`.
+
+Модели данных (camelCase; даты — UTC ISO8601-строки как лежат в БД):
+
+```jsonc
+// DocumentSummary (элемент списка и ответ PATCH)
+{
+  "id": 1,
+  "title": "instr",                       // имя файла первой check-версии без расширения
+  "position": "", "department": "", "notes": "",   // редактируемые метаданные
+  "createdAt": "2026-09-07T09:00:00.000+00:00",
+  "updatedAt": "…",                       // обновляется при добавлении версии/правке метаданных
+  "versionsCount": 2, "fixedCount": 1,
+  "lastCheck": {                          // последняя check-версия или null
+    "verdict": "risk" | "ok" | "fail" | null,
+    "checkedAt": "…",
+    "findingsCount": 3
+  }
+}
+
+// VersionSummary (элемент versions в детализации документа)
+{
+  "id": 7,
+  "origin": "check" | "fix",
+  "filename": "instr.docx",               // у fix — "<stem>_исправленная.docx"
+  "createdAt": "…",
+  "verdict": "risk" | null,               // осмыслен только у check
+  "findingsCount": 3,
+  "fixMethod": null | "docx" | "text" | "llm",  // только у fix (как /fix)
+  "appliedEditIds": ["e1"],               // только у fix
+  "parentVersionId": null | 5,            // у fix — id check-версии-родителя
+  "jobId": "abc123"                       // jobId джобы, из которой получена версия
+}
+
+// VersionDetail (GET /api/history/versions/{id}) = VersionSummary плюс:
+{
+  "documentId": 1,
+  "text": "…",                            // извлечённый текст (у fix — пустая строка)
+  "textTruncated": false,
+  "report": "…markdown-отчёт…",           // у fix — null
+  "findings": [                           // только у check
+    { "editId": "e1", "title": "…", "original": "…", "replacement": "…", "reason": "…" }
+  ]
+}
+```
+
+### GET /api/history/documents?search=&limit=100&offset=0
+`{"total": N, "items": [DocumentSummary]}`, сортировка по `updatedAt` по убыванию. `search` — регистронезависимый (включая кириллицу) LIKE по position/department/title. Валидация: `limit` 1..500 (иначе 400 `invalid_limit`), `offset` ≥ 0 (иначе 400 `invalid_offset`).
+
+### GET /api/history/documents/{id}
+200 — поля документа (`id`, `title`, `position`, `department`, `notes`, `createdAt`, `updatedAt`) + `"versions": [VersionSummary]` (по возрастанию `createdAt`; без bytes/text/report). 404 — `document_not_found`.
+
+### PATCH /api/history/documents/{id}
+Body: `{ "position"?, "department"?, "title"?, "notes"? }` — обновляются только переданные поля. 200 — обновлённый `DocumentSummary` (с агрегатами); 404 — `document_not_found`.
+
+### DELETE /api/history/documents/{id}
+200 — `{"ok": true}`; версии и замечания удаляются каскадом. 404 — `document_not_found`.
+
+### GET /api/history/versions/{id}
+200 — `VersionDetail`; 404 — `version_not_found`.
+
+### GET /api/history/versions/{id}/download
+Байты сохранённого файла: у check — исходный загруженный файл (любого поддерживаемого формата), у fix — исправленный .docx. `Content-Disposition: attachment; filename*=UTF-8''…`, media_type по расширению (docx/pdf/odt/doc/txt/md). 404 — `version_not_found`; 404 — `no_file_data`, если байты не сохранились (пустые).
+
+### POST /api/history/documents/{id}/extract-meta
+Заполнение должности/подразделения одним LLM-вызовом: в модель уходят первые 6000 символов текста последней check-версии; ответ — JSON `{"position": "…", "department": "…"}` (парсится json.loads с fallback на brace-matching; не-словарь/не-строки — ошибка). Сохраняются только непустые значения — пустые не затирают существующие.
+200 — `{"position": "…", "department": "…"}` (итоговые значения после слияния); 404 — `document_not_found`; 409 — `no_text` (нет check-версии или её текст пуст); 502 — ошибка LLM или `{"detail": "invalid_meta_response"}`.
+
+### POST /api/history/extract-meta
+Пакетное извлечение: body `{ "documentIds": [1,2] | null }`; `null`/отсутствие — все документы с пустыми position И department. Обработка параллельно, до 2 одновременно; ошибка одного документа не прерывает остальные. 200 — `{"results": [{ "documentId": 1, "position": "…", "department": "…", "error": null | "код или текст ошибки" }]}` (при ошибке position/department — пустые строки; коды ошибок те же: `document_not_found`, `no_text`, `invalid_meta_response`, текст ошибки LLM).
+
+### GET /api/history/export/fixed?documentIds=1,2
+ZIP-архив с последней fix-версией каждого документа (без параметра — всех). Имена в архиве — `filename` версии; коллизии получают суффикс `_2.docx` (как в /fix-all). `Content-Disposition: attachment; filename="ispravlennye_di.zip"`, media `application/zip`. 404 — `no_fixed_files` (fix-версий нет); 400 — `invalid_document_ids` (нецелые id).
+
 ## Поведение фронтенда
 
 - Выбор файла-отчёта и правок keyed по `resultIndex` (не по имени файла) — дубликаты имён не ломают UI.

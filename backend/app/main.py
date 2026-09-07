@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import extractors, llm, settings, updater
+from . import extractors, history, llm, settings, updater
 from .logsetup import setup_logging
 
 # Логи настраивает точка входа (run.py); в dev (uvicorn напрямую) — консоль.
@@ -130,6 +130,17 @@ class TestRequest(BaseModel):
 class FixRequest(BaseModel):
     resultIndex: int
     editIds: list[str]
+
+
+class DocumentPatch(BaseModel):
+    position: str | None = None
+    department: str | None = None
+    title: str | None = None
+    notes: str | None = None
+
+
+class ExtractMetaBatchRequest(BaseModel):
+    documentIds: list[int] | None = None
 
 
 # ---------- Settings ----------
@@ -476,6 +487,23 @@ async def _check_file(
             result["edits"] = edits
             result["summaryVerdict"] = verdict or _summary_verdict(report)
             result["status"] = "done"
+            # история: не отвечает за проверку — любая ошибка БД только в лог
+            hist = job.get("_history")
+            if hist and hist.get("batch_id") is not None:
+                try:
+                    hist["version_ids"][index] = history.save_check_version(
+                        hist["batch_id"],
+                        result["filename"],
+                        Path(result["filename"]).suffix.lower(),
+                        job["_files"].get(index, b""),
+                        job["_texts"].get(index, ""),
+                        bool(result.get("textTruncated")),
+                        result.get("report"),
+                        result.get("summaryVerdict"),
+                        result.get("edits") or [],
+                    )
+                except Exception as e:
+                    logger.warning("History save failed: %s", e)
             logger.info(
                 "Джоба %s, файл %s: готово за %.1f с, правок %d, вердикт %s",
                 job["id"], result["filename"], time.monotonic() - started,
@@ -660,7 +688,20 @@ async def create_check(
     _evict_job_payloads()
 
     job_id = uuid.uuid4().hex[:12]
-    _jobs[job_id] = {
+    # история: регистрируем батч проверки (упавшая БД не мешает проверке)
+    history_batch_id: int | None = None
+    try:
+        history_batch_id = history.ensure_batch(
+            job_id,
+            state["activeProvider"],
+            state["activeModel"],
+            contractSubject,
+            employmentType,
+            extraContext,
+        )
+    except Exception as e:
+        logger.warning("History save failed: %s", e)
+    job = {
         "id": job_id,
         "status": "running",
         "created_at": time.monotonic(),
@@ -670,6 +711,9 @@ async def create_check(
         "tasks": [],   # активные задачи файлов (для отмены)
         "cancel_requested": False,
     }
+    if history_batch_id is not None:
+        job["_history"] = {"batch_id": history_batch_id, "version_ids": {}}
+    _jobs[job_id] = job
     user_fields = {
         "contract_subject": contractSubject,
         "employment_type": employmentType,
@@ -1007,6 +1051,14 @@ async def fix_document(job_id: str, body: FixRequest):
         "Fix %s[%d]: применено методом %s", job_id, body.resultIndex, method
     )
     filename = f"{Path(job['results'][body.resultIndex]['filename']).stem}_исправленная.docx"
+    # история: сохраняем исправленную версию (ошибка БД не ломает фикс)
+    hist = job.get("_history") or {}
+    parent = hist.get("version_ids", {}).get(body.resultIndex)
+    if parent is not None:
+        try:
+            history.save_fixed_version(parent, docx_bytes, method, body.editIds, filename)
+        except Exception as e:
+            logger.warning("History save failed: %s", e)
     return Response(
         content=docx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1044,6 +1096,14 @@ async def _fix_one(
     logger.info(
         "Fix-all %s[%d]: применено методом %s", job["id"], item.resultIndex, method
     )
+    # история: сохраняем исправленную версию (ошибка БД не ломает фикс)
+    hist = job.get("_history") or {}
+    parent = hist.get("version_ids", {}).get(item.resultIndex)
+    if parent is not None:
+        try:
+            history.save_fixed_version(parent, docx_bytes, method, item.editIds, arcname)
+        except Exception as e:
+            logger.warning("History save failed: %s", e)
     return arcname, docx_bytes, None
 
 
@@ -1203,6 +1263,290 @@ async def export_job(job_id: str, format: str = "md"):
         headers={
             "Content-Disposition": f'attachment; filename="di_check_{job_id}.{ext}"'
         },
+    )
+
+
+# ---------- История проверок (SQLite) ----------
+
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+# media_type по расширению сохранённого файла (fix-версии всегда .docx)
+_VERSION_MIME = {
+    ".docx": _DOCX_MIME,
+    ".doc": "application/msword",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+}
+META_SYSTEM_PROMPT = (
+    "Извлеки из фрагмента должностной инструкции должность и подразделение. "
+    'Верни только JSON без пояснений и markdown: {"position": "…", "department": "…"}. '
+    "Если поле не найдено — пустая строка."
+)
+META_TEXT_LIMIT = 6000  # символов текста ДИ, уходящих в user-message extract-meta
+
+
+def _validate_paging(limit: int, offset: int) -> None:
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="invalid_limit")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="invalid_offset")
+
+
+def _document_summary(row: dict) -> dict:
+    last = None
+    if row.get("last_check_at") is not None:
+        last = {
+            "verdict": row.get("last_verdict"),
+            "checkedAt": row["last_check_at"],
+            "findingsCount": row.get("last_findings_count") or 0,
+        }
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "position": row["position"],
+        "department": row["department"],
+        "notes": row["notes"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "versionsCount": row["versions_count"],
+        "fixedCount": row["fixed_count"],
+        "lastCheck": last,
+    }
+
+
+def _findings_count(v: dict) -> int:
+    """Сводка несёт готовый count, детальная версию — список findings."""
+    if "findings_count" in v:
+        return int(v["findings_count"])
+    return len(v.get("findings") or [])
+
+
+def _version_summary(v: dict) -> dict:
+    return {
+        "id": v["id"],
+        "origin": v["origin"],
+        "filename": v["filename"],
+        "createdAt": v["created_at"],
+        "verdict": v["verdict"],
+        "findingsCount": _findings_count(v),
+        "fixMethod": v["fix_method"],
+        "appliedEditIds": v["applied_edit_ids"],
+        "parentVersionId": v["parent_version_id"],
+        "jobId": v["job_id"],
+    }
+
+
+def _version_detail(v: dict) -> dict:
+    return {
+        **_version_summary(v),
+        "documentId": v["document_id"],
+        "text": v["text"],
+        "textTruncated": v["text_truncated"],
+        "report": v["report"],
+        "findings": [
+            {
+                "editId": f["edit_id"],
+                "title": f["title"],
+                "original": f["original"],
+                "replacement": f["replacement"],
+                "reason": f["reason"],
+            }
+            for f in v["findings"]
+        ],
+    }
+
+
+@app.get("/api/history/documents")
+async def history_documents(search: str = "", limit: int = 100, offset: int = 0):
+    _validate_paging(limit, offset)
+    total, rows = history.list_documents(search, limit, offset)
+    return {"total": total, "items": [_document_summary(r) for r in rows]}
+
+
+@app.get("/api/history/documents/{document_id}")
+async def history_document_get(document_id: int):
+    doc = history.get_document(document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="document_not_found")
+    return {
+        "id": doc["id"],
+        "title": doc["title"],
+        "position": doc["position"],
+        "department": doc["department"],
+        "notes": doc["notes"],
+        "createdAt": doc["created_at"],
+        "updatedAt": doc["updated_at"],
+        "versions": [_version_summary(v) for v in doc["versions"]],
+    }
+
+
+@app.patch("/api/history/documents/{document_id}")
+async def history_document_patch(document_id: int, body: DocumentPatch):
+    doc = history.update_document(document_id, **body.model_dump(exclude_none=True))
+    if doc is None:
+        raise HTTPException(status_code=404, detail="document_not_found")
+    summary = history.document_summary(document_id)
+    return _document_summary(summary)
+
+
+@app.delete("/api/history/documents/{document_id}")
+async def history_document_delete(document_id: int):
+    if not history.delete_document(document_id):
+        raise HTTPException(status_code=404, detail="document_not_found")
+    return {"ok": True}
+
+
+@app.get("/api/history/versions/{version_id}")
+async def history_version_get(version_id: int):
+    version = history.get_version(version_id)
+    if version is None:
+        raise HTTPException(status_code=404, detail="version_not_found")
+    return _version_detail(version)
+
+
+@app.get("/api/history/versions/{version_id}/download")
+async def history_version_download(version_id: int):
+    version = history.get_version(version_id)
+    if version is None:
+        raise HTTPException(status_code=404, detail="version_not_found")
+    data = history.get_version_bytes(version_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="no_file_data")
+    ext = (version.get("file_ext") or "").lower()
+    filename = version.get("filename") or "document.docx"
+    return Response(
+        content=data,
+        media_type=_VERSION_MIME.get(ext, _DOCX_MIME),
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"
+        },
+    )
+
+
+def _parse_meta_response(raw: str) -> dict:
+    """Разбирает ответ модели в {"position", "department"}; иначе LLMError."""
+    data = None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        idx = raw.find("{")
+        if idx != -1:
+            end = _matching_brace(raw, idx)
+            if end != -1:
+                try:
+                    data = json.loads(raw[idx:end])
+                except json.JSONDecodeError:
+                    data = None
+    if not isinstance(data, dict):
+        raise llm.LLMError("invalid_meta_response")
+    position = data.get("position")
+    department = data.get("department")
+    if not isinstance(position, str) or not isinstance(department, str):
+        raise llm.LLMError("invalid_meta_response")
+    return {"position": position.strip(), "department": department.strip()}
+
+
+async def _extract_meta_for_document(document_id: int) -> tuple[str, str]:
+    """LLM-извлечение должности/подразделения + запись в документ.
+
+    HTTPException — нет документа/текста; llm.LLMError — сбой вызова/ответа.
+    """
+    if history.get_document(document_id) is None:
+        raise HTTPException(status_code=404, detail="document_not_found")
+    text = history.latest_check_text(document_id)
+    if not text:
+        raise HTTPException(status_code=409, detail="no_text")
+    state = settings.get_settings_state()
+    raw = await llm.chat_completion(
+        state["activeProvider"],
+        state["activeModel"],
+        META_SYSTEM_PROMPT,
+        text[:META_TEXT_LIMIT],
+    )
+    meta = _parse_meta_response(raw)
+    updated = history.extract_meta_update(document_id, meta["position"], meta["department"])
+    if updated is None:  # документ удалён параллельным запросом
+        raise HTTPException(status_code=404, detail="document_not_found")
+    return updated
+
+
+@app.post("/api/history/documents/{document_id}/extract-meta")
+async def history_extract_meta(document_id: int):
+    try:
+        position, department = await _extract_meta_for_document(document_id)
+    except llm.LLMError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"position": position, "department": department}
+
+
+@app.post("/api/history/extract-meta")
+async def history_extract_meta_batch(body: ExtractMetaBatchRequest):
+    document_ids = (
+        body.documentIds if body.documentIds is not None
+        else history.document_ids_missing_meta()
+    )
+    sem = asyncio.Semaphore(2)
+
+    async def one(document_id: int) -> dict:
+        try:
+            async with sem:
+                position, department = await _extract_meta_for_document(document_id)
+            return {
+                "documentId": document_id,
+                "position": position,
+                "department": department,
+                "error": None,
+            }
+        except HTTPException as e:
+            return {
+                "documentId": document_id,
+                "position": "",
+                "department": "",
+                "error": str(e.detail),
+            }
+        except Exception as e:
+            return {
+                "documentId": document_id,
+                "position": "",
+                "department": "",
+                "error": str(e),
+            }
+
+    results = await asyncio.gather(*(one(i) for i in document_ids))
+    return {"results": list(results)}
+
+
+@app.get("/api/history/export/fixed")
+async def history_export_fixed(documentIds: str = ""):
+    raw = (documentIds or "").strip()
+    ids: list[int] | None
+    if raw:
+        try:
+            ids = [int(part) for part in raw.split(",") if part.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_document_ids")
+    else:
+        ids = None
+    files = history.latest_fixed_versions(ids)
+    if not files:
+        raise HTTPException(status_code=404, detail="no_fixed_files")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        used: set[str] = set()
+        for _title, data, filename in files:
+            # не допускаем коллизий имён (как в /fix-all)
+            name = filename or "document.docx"
+            n = 2
+            while name in used:
+                name = f"{Path(name).stem}_{n}.docx"
+                n += 1
+            used.add(name)
+            zf.writestr(name, data)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="ispravlennye_di.zip"'},
     )
 
 
