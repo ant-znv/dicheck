@@ -351,7 +351,7 @@ export default function SettingsPanel({ settings, onUpdated, onError, autoUpdate
               setUpdateRepo(e.target.value)
               setUpdateRepoState('idle')
             }}
-            placeholder="например: anton/DI_Check"
+            placeholder="ant-znv/dicheck"
             className={inputCls}
           />
         </div>

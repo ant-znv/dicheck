@@ -63,8 +63,8 @@ Python и Node.js на машине не нужны: фронтенд и про�
 
 Апдейтеру нужно знать, откуда качать обновления, — это `owner/repo` на GitHub:
 
-1. Откройте страницу вашего репозитория на GitHub — адрес вида `https://github.com/anton/DI_Check`. Здесь `anton` — **owner**, `DI_Check` — **repo**; вместе: `anton/DI_Check`.
-2. Через git это видно командой `git remote -v` в папке проекта: в URL `git@github.com:anton/DI_Check.git` или `https://github.com/anton/DI_Check.git` та же пара `owner/repo`.
+1. Откройте страницу вашего репозитория на GitHub — адрес вида `https://github.com/ant-znv/dicheck`. Здесь `ant-znv` — **owner**, `dicheck` — **repo**; вместе: `ant-znv/dicheck`.
+2. Через git это видно командой `git remote -v` в папке проекта: в URL `git@github.com:ant-znv/dicheck.git` или `https://github.com/ant-znv/dicheck.git` та же пара `owner/repo`.
 3. Если репозитория ещё нет — создайте на [github.com/new](https://github.com/new) (публичный, чтобы обновления работали без токена) и подключите локально:
    ```
    git remote add origin https://github.com/<owner>/DI_Check.git

@@ -27,7 +27,7 @@ from pathlib import Path
 from .version import APP_VERSION
 
 # owner/repo по умолчанию; можно переопределить в настройках (%APPDATA% config).
-DEFAULT_REPO = ""
+DEFAULT_REPO = "ant-znv/dicheck"
 SETUP_ASSET_NAME = "DI_Check_setup.exe"
 GITHUB_API = "https://api.github.com"
 CHECK_TIMEOUT = 15
