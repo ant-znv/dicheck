@@ -55,6 +55,31 @@ Python и Node.js на машине не нужны: фронтенд и про�
 
 Приватность: всё работает локально, ключи никогда не покидают машину — они отправляются только в API выбранного провайдера при выполнении проверки. Через API приложения ключи не возвращаются (только флаг наличия ключа).
 
+## Обновления
+
+Приложение умеет самообновляться через GitHub Releases: при старте сервер тихо проверяет последний релиз, а в настройках (раздел «Обновления») можно проверить и установить новую версию одной кнопкой — установщик скачается во `%TEMP%`, сам закроет приложение, обновит файлы и запустит новую версию (настройки и ключи в `%APPDATA%\DI_Check` сохраняются).
+
+### Где взять owner/repo репозитория
+
+Апдейтеру нужно знать, откуда качать обновления, — это `owner/repo` на GitHub:
+
+1. Откройте страницу вашего репозитория на GitHub — адрес вида `https://github.com/anton/DI_Check`. Здесь `anton` — **owner**, `DI_Check` — **repo**; вместе: `anton/DI_Check`.
+2. Через git это видно командой `git remote -v` в папке проекта: в URL `git@github.com:anton/DI_Check.git` или `https://github.com/anton/DI_Check.git` та же пара `owner/repo`.
+3. Если репозитория ещё нет — создайте на [github.com/new](https://github.com/new) (публичный, чтобы обновления работали без токена) и подключите локально:
+   ```
+   git remote add origin https://github.com/<owner>/DI_Check.git
+   git push -u origin main
+   ```
+
+Впишите пару `owner/repo` в настройках приложения (раздел «Обновления») — пересборка не нужна. Для приватного репозитория дополнительно сохраните там же токен GitHub (PAT с правом `Contents: read`).
+
+### Как выпустить новую версию
+
+1. Поднимите версию в `backend/app/version.py` (`APP_VERSION`).
+2. Закоммитьте и поставьте тег: `git tag v0.2.0 && git push origin main --tags`.
+3. GitHub Actions (`.github/workflows/build.yml`) соберёт фронтенд, прогонит тесты, соберёт exe и установщик и опубликует релиз с файлами `DI_Check_setup.exe` и `DI_Check_portable.zip`.
+4. Установленные приложения увидят обновление (по тегу релиза) и обновятся в один клик.
+
 ## Tesseract OCR (опционально)
 
 Для сканированных PDF можно установить [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) с языковыми пакетами `rus` + `eng`. Без него приложение корректно обработает текстовые PDF, а для сканов покажет подсказку об отсутствии OCR.
@@ -79,8 +104,9 @@ Python и Node.js на машине не нужны: фронтенд и про�
 | Сборка фронтенда | `cd frontend && npm run build` |
 | Сборка портативного exe | `build_exe.bat` (запускает PyInstaller по `DI_Check.spec`) |
 | Сборка установщика | `build_exe.bat` (шаг Inno Setup; требует ISCC — Inno Setup 6/7) |
+| CI/релизы | `.github/workflows/build.yml`: push в main — артефакты, тег `vX.Y.Z` — GitHub Release |
 
-Сборка создаёт `dist\DI_Check\` (DI_Check.exe + `_internal`), zip-архив `DI_Check_portable.zip` и установщик `dist\installer\DI_Check_setup.exe` (если найден Inno Setup). В exe встроены фронтенд и промт. Установщик описан в `DI_Check.iss`: установка без прав администратора, ярлыки в меню «Пуск» и на рабочем столе (опционально), запуск после установки.
+Сборка создаёт `dist\DI_Check\` (DI_Check.exe + `_internal`), zip-архив `DI_Check_portable.zip` и установщик `dist\installer\DI_Check_setup.exe` (если найден Inno Setup). В exe встроены фронтенд и промт. Установщик описан в `DI_Check.iss`: установка без прав администратора, ярлыки в меню «Пуск» и на рабочем столе (опционально), запуск после установки, остановка запущенного приложения и чистка окружения PyInstaller при установке поверх (важно для самообновления). Версия установщика передаётся как `/DMyAppVersion=X.Y.Z` (локально берётся из `backend/app/version.py`).
 
 Сквозной тест с реальным API-ключом (нужен запущенный сервер): `backend/testdata/verify_batch.py` — check → export docx → fix-all.
 

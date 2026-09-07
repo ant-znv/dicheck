@@ -17,6 +17,7 @@ DI_Check — локальное веб-приложение для провер�
 - `requirements.txt` — зависимости бэкенда, ставятся в `.venv` в корне; `requirements.lock.txt` — зафиксированные версии (`pip freeze`); `requirements-dev.txt` — pytest и pyinstaller.
 - `backend/tests/` — pytest-сьют бэкенда (LLM мокается, сеть/ключи/Word/Tesseract не нужны); запуск из корня проекта.
 - `run.py` + `DI_Check.spec` + `build_exe.bat` — портативная сборка (PyInstaller onedir): exe со встроенными фронтендом и промтом; `build_exe.bat` собирает `dist\DI_Check\` и `DI_Check_portable.zip`. В frozen-режиме ресурсы берутся из `sys._MEIPASS` (см. FRONTEND_DIST в main.py).
+- `backend/app/updater.py` — самообновление через GitHub Releases (check/install, внешние вызовы инъецируются); `DI_Check.iss` — установщик Inno Setup (per-user, чистка `_PYI_*`, taskkill без `/T`, `[Run] skipifnotsilent`); `.github/workflows/build.yml` — CI: артефакты на push в main, релиз на тегах `vX.Y.Z`. Релиз: поднять `APP_VERSION` в `backend/app/version.py` → тег `v*` → push.
 
 ## Команды
 

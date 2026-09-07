@@ -44,15 +44,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM --- 5. Installer (Inno Setup, esli nayden) ---
+REM --- 5. Installer (Inno Setup, esli nayden); versiya iz koda ---
 set "ISCC="
 if exist "tools\innosetup\ISCC.exe" set "ISCC=tools\innosetup\ISCC.exe"
 if not defined ISCC if exist "%ProgramFiles%\Inno Setup 7\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Setup 7\ISCC.exe"
 if not defined ISCC if exist "%ProgramFiles(x86)%\Inno Setup 7\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 7\ISCC.exe"
 if not defined ISCC if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 if defined ISCC (
-    echo [DI_Check] Sborka ustanovshchika: "%ISCC%"...
-    "%ISCC%" DI_Check.iss
+    for /f "usebackq delims=" %%v in (`".venv\Scripts\python.exe" -c "from backend.app.version import APP_VERSION; print(APP_VERSION)"`) do set "APPVER=%%v"
+    echo [DI_Check] Sborka ustanovshchika (versiya %APPVER%): "%ISCC%"...
+    "%ISCC%" /DMyAppVersion=%APPVER% DI_Check.iss
     if errorlevel 1 (
         echo [DI_Check] Oshibka sborki ustanovshchika.
         pause

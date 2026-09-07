@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import extractors, llm, settings
+from . import extractors, llm, settings, updater
 
 logger = logging.getLogger("di_check")
 if not logging.getLogger().handlers:
@@ -72,11 +72,16 @@ class SettingsUpdate(BaseModel):
     activeProvider: str | None = None
     activeModel: str | None = None
     systemPrompt: str | None = None
+    updateRepo: str | None = None
 
 
 class ApiKeyUpdate(BaseModel):
     provider: str
     apiKey: str
+
+
+class UpdateTokenUpdate(BaseModel):
+    token: str
 
 
 class TestRequest(BaseModel):
@@ -104,9 +109,35 @@ async def put_settings(body: SettingsUpdate):
             active_model=body.activeModel,
             system_prompt=body.systemPrompt,
         )
+        if body.updateRepo is not None:
+            settings.save_update_repo(body.updateRepo)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return settings.build_settings_response()
+
+
+@app.put("/api/settings/update-token")
+async def put_update_token(body: UpdateTokenUpdate):
+    """Токен GitHub (только для приватного репозитория). Пустая строка — удалить."""
+    settings.save_update_token(body.token)
+    return {"ok": True, "hasToken": bool(settings.get_update_config()["token"])}
+
+
+@app.get("/api/update/check")
+async def update_check():
+    """Проверка обновлений. Не падает никогда — ошибки внутри ответа."""
+    cfg = settings.get_update_config()
+    return updater.check(repo=cfg["repo"], token=cfg["token"])
+
+
+@app.post("/api/update/install")
+async def update_install():
+    """Скачать установщик новой версии и запустить его; он сам перезапустит приложение."""
+    cfg = settings.get_update_config()
+    try:
+        return updater.install(repo=cfg["repo"], token=cfg["token"])
+    except updater.UpdateError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.put("/api/settings/apikey")

@@ -12,6 +12,18 @@ export interface Settings {
   activeModel: string
   systemPrompt: string
   defaultSystemPrompt: string
+  version: string
+  update: {
+    repo: string
+    hasToken: boolean
+  }
+}
+
+export interface UpdateInfo {
+  current: string
+  latest: string | null
+  updateAvailable: boolean
+  error: string | null
 }
 
 export interface TestConnectionResult {
@@ -119,7 +131,19 @@ export const api = {
     activeProvider?: string
     activeModel?: string
     systemPrompt?: string
+    updateRepo?: string
   }) => request<Settings>('/api/settings', jsonInit('PUT', body)),
+
+  putUpdateToken: (token: string) =>
+    request<{ ok: boolean; hasToken: boolean }>(
+      '/api/settings/update-token',
+      jsonInit('PUT', { token }),
+    ),
+
+  checkUpdate: () => request<UpdateInfo>('/api/update/check'),
+
+  installUpdate: () =>
+    request<{ ok: boolean; version: string }>('/api/update/install', { method: 'POST' }),
 
   putApiKey: (provider: string, apiKey: string) =>
     request<{ ok: boolean; hasApiKey: boolean }>(

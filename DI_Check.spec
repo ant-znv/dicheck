@@ -5,6 +5,8 @@
 Результат: dist/DI_Check/ (DI_Check.exe + _internal).
 """
 
+from PyInstaller.utils.hooks import collect_submodules
+
 a = Analysis(
     ["run.py"],
     pathex=[],
@@ -14,14 +16,8 @@ a = Analysis(
         ("backend/app/default_prompt.md", "backend/app"),
     ],
     hiddenimports=[
-        # uvicorn: динамические импорты цикла событий / протоколов / lifespan
-        "uvicorn.loops.auto",
-        "uvicorn.loops.asyncio",
-        "uvicorn.protocols.http.auto",
-        "uvicorn.protocols.http.h11_impl",
-        "uvicorn.protocols.websockets.auto",
-        "uvicorn.lifespan.on",
-        "uvicorn.lifespan.off",
+        # uvicorn: loop/protocol/lifespan грузятся динамически — берём всё
+        *collect_submodules("uvicorn"),
         # python-multipart (разбор форм; имя модуля зависит от версии)
         "multipart",
         "python_multipart",

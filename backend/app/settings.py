@@ -13,6 +13,8 @@ import threading
 from ctypes import wintypes
 from pathlib import Path
 
+from .version import APP_VERSION
+
 PROVIDERS = {
     "deepseek": {
         "id": "deepseek",
@@ -172,15 +174,55 @@ def save_api_key(provider: str, api_key: str) -> None:
         _save(cfg)
 
 
+# ---------- Обновления (GitHub Releases) ----------
+
+def get_update_config() -> dict:
+    """Репозиторий ('owner/name' или '') и расшифрованный токен (или None)."""
+    with _lock:
+        cfg = _load()
+    repo = (cfg.get("updateRepo") or "").strip()
+    token: str | None = None
+    enc = (cfg.get("updateToken") or "").strip()
+    if enc:
+        try:
+            token = _dpapi_unprotect(base64.b64decode(enc)).decode("utf-8")
+        except Exception:
+            token = None  # битый/чужой DPAPI-блоб — считаем токена нет
+    return {"repo": repo, "token": token}
+
+
+def save_update_repo(repo: str) -> None:
+    with _lock:
+        cfg = _load()
+        cfg["updateRepo"] = repo.strip()
+        _save(cfg)
+
+
+def save_update_token(token: str) -> None:
+    """Пустая строка — удалить токен. Хранится зашифрованным (DPAPI)."""
+    with _lock:
+        cfg = _load()
+        if not token.strip():
+            cfg["updateToken"] = ""
+        else:
+            cfg["updateToken"] = base64.b64encode(
+                _dpapi_protect(token.strip().encode("utf-8"))
+            ).decode("ascii")
+        _save(cfg)
+
+
 def build_settings_response() -> dict:
     state = get_settings_state()
     providers = []
     for p in PROVIDERS.values():
         providers.append({**p, "hasApiKey": has_api_key(p["id"])})
+    update_cfg = get_update_config()
     return {
         "providers": providers,
         "activeProvider": state["activeProvider"],
         "activeModel": state["activeModel"],
         "systemPrompt": state["systemPrompt"],
         "defaultSystemPrompt": default_system_prompt(),
+        "version": APP_VERSION,
+        "update": {"repo": update_cfg["repo"], "hasToken": bool(update_cfg["token"])},
     }

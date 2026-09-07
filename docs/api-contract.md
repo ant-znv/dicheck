@@ -29,7 +29,9 @@
   "activeProvider": "deepseek",
   "activeModel": "deepseek-chat",
   "systemPrompt": "…",                       // текущий системный промт (редактируемый)
-  "defaultSystemPrompt": "…"                 // промт по умолчанию (для кнопки «сбросить»)
+  "defaultSystemPrompt": "…",                // промт по умолчанию (для кнопки «сбросить»)
+  "version": "0.1.0",                        // версия приложения (backend/app/version.py)
+  "update": { "repo": "owner/DI_Check", "hasToken": false }  // настройки самообновления
 }
 ```
 
@@ -39,7 +41,16 @@
 Возвращает `Settings`. При первом запуске активный провайдер — `deepseek`, промт — по умолчанию. API-ключи задаются пользователем в настройках и хранятся зашифрованными в `%APPDATA%` (в репозитории ключей нет).
 
 ### PUT /api/settings
-Body: `{ "activeProvider"?, "activeModel"?, "systemPrompt"? }` → возвращает обновлённый `Settings`.
+Body: `{ "activeProvider"?, "activeModel"?, "systemPrompt"?, "updateRepo"? }` → возвращает обновлённый `Settings`. `updateRepo` — репозиторий самообновления в формате `owner/repo`.
+
+### PUT /api/settings/update-token
+Body: `{ "token": "ghp_..." }` — токен GitHub (нужен только для приватного репозитория обновлений), хранится зашифрованным (DPAPI). Пустая строка — удалить. Ответ: `{ "ok": true, "hasToken": true }`.
+
+### GET /api/update/check
+Проверка обновлений через GitHub Releases (`/releases/latest`, публичный — без токена, приватный — с сохранённым токеном). Никогда не падает: `{"current": "0.1.0", "latest": "v0.2.0", "updateAvailable": true, "error": null}` либо `{"current": "...", "latest": null, "updateAvailable": false, "error": "описание"}` (404 приватного репо/нет сети/не задан репозиторий — это ошибки-состояния, не исключения). Сравнение версий — семверное (тег `v`-префикс и `-суффикс` отрезаются).
+
+### POST /api/update/install
+Скачать установщик последнего релиза (asset с точным именем `DI_Check_setup.exe`) в `%TEMP%`, проверить sha256 (если GitHub отдал `digest`), запустить `setup /SILENT` в фоне без ожидания: установщик сам остановит приложение, обновит файлы и запустит новую версию (в установщике чистятся `_PYI_*`-переменные PyInstaller и делается `taskkill` приложения без `/T`). Ответ: `{"ok": true, "version": "v0.2.0", "path": "%TEMP%\\di-check-setup-v020.exe"}`. Ошибки: 502 — `{detail}` (нет обновления, нет asset, не совпал sha256 и т.п.).
 
 ### PUT /api/settings/apikey
 Body: `{ "provider": "deepseek"|"zai", "apiKey": "sk-..." }` — сохраняет ключ зашифрованным (DPAPI) в `%APPDATA%\DI_Check\config.json`. Пустая строка — удалить ключ. Ответ: `{ "ok": true, "hasApiKey": true }`.

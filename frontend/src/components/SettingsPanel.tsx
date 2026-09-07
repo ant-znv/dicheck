@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { api, type Settings } from '../api'
+import { api, type Settings, type UpdateInfo } from '../api'
 
 type SaveState = 'idle' | 'saving' | 'saved' | 'error'
 
@@ -7,6 +7,7 @@ interface Props {
   settings: Settings
   onUpdated: (s: Settings) => void
   onError: (msg: string) => void
+  autoUpdateInfo?: UpdateInfo | null
 }
 
 function StatusNote({ state, errorText }: { state: SaveState; errorText?: string }) {
@@ -23,7 +24,7 @@ const btnCls =
 const btnPrimaryCls =
   'cursor-pointer rounded-lg bg-sky-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50'
 
-export default function SettingsPanel({ settings, onUpdated, onError }: Props) {
+export default function SettingsPanel({ settings, onUpdated, onError, autoUpdateInfo }: Props) {
   const [provider, setProvider] = useState(settings.activeProvider)
   const [model, setModel] = useState(settings.activeModel)
   const [fetchedModels, setFetchedModels] = useState<string[]>([])
@@ -37,6 +38,15 @@ export default function SettingsPanel({ settings, onUpdated, onError }: Props) {
 
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null)
+
+  const [updateRepo, setUpdateRepo] = useState(settings.update.repo)
+  const [updateRepoState, setUpdateRepoState] = useState<SaveState>('idle')
+  const [updateToken, setUpdateToken] = useState('')
+  const [updateTokenState, setUpdateTokenState] = useState<SaveState>('idle')
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(autoUpdateInfo ?? null)
+  const [checkingUpdate, setCheckingUpdate] = useState(false)
+  const [installingUpdate, setInstallingUpdate] = useState(false)
+  const [installNote, setInstallNote] = useState<string | null>(null)
 
   const currentProvider = useMemo(
     () => settings.providers.find((p) => p.id === provider) ?? settings.providers[0],
@@ -115,6 +125,62 @@ export default function SettingsPanel({ settings, onUpdated, onError }: Props) {
       setTestResult({ ok: false, text: errorText(e) })
     } finally {
       setTesting(false)
+    }
+  }
+
+  const saveUpdateRepo = async () => {
+    setUpdateRepoState('saving')
+    try {
+      const updated = await api.putSettings({ updateRepo: updateRepo.trim() })
+      onUpdated(updated)
+      setUpdateRepoState('saved')
+    } catch (e) {
+      setUpdateRepoState('error')
+      onError(errorText(e))
+    }
+  }
+
+  const saveUpdateToken = async () => {
+    setUpdateTokenState('saving')
+    try {
+      const res = await api.putUpdateToken(updateToken.trim())
+      onUpdated({
+        ...settings,
+        update: { ...settings.update, hasToken: res.hasToken },
+      })
+      setUpdateToken('')
+      setUpdateTokenState('saved')
+    } catch (e) {
+      setUpdateTokenState('error')
+      onError(errorText(e))
+    }
+  }
+
+  const runUpdateCheck = async () => {
+    setCheckingUpdate(true)
+    setInstallNote(null)
+    try {
+      setUpdateInfo(await api.checkUpdate())
+    } catch (e) {
+      onError(errorText(e))
+    } finally {
+      setCheckingUpdate(false)
+    }
+  }
+
+  const runUpdateInstall = async () => {
+    setInstallingUpdate(true)
+    setInstallNote(null)
+    try {
+      const res = await api.installUpdate()
+      setInstallNote(
+        `Установщик версии ${res.version} запущен в фоне: он закроет приложение, обновит файлы и запустит новую версию.`,
+      )
+      setUpdateInfo(null)
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Не удалось запустить обновление')
+    } finally {
+      setInstallingUpdate(false)
     }
   }
 
@@ -266,6 +332,96 @@ export default function SettingsPanel({ settings, onUpdated, onError }: Props) {
           </button>
           <StatusNote state={promptState} />
         </div>
+      </section>
+
+      {/* Обновления */}
+      <section className="space-y-3 border-t border-zinc-800 pt-4">
+        <h3 className="text-sm font-semibold text-zinc-300">
+          Обновления{' '}
+          <span className="text-xs font-normal text-zinc-500">версия {settings.version}</span>
+        </h3>
+        <div>
+          <label htmlFor="updateRepo" className="mb-1 block text-xs text-zinc-400">
+            Репозиторий GitHub (owner/repo)
+          </label>
+          <input
+            id="updateRepo"
+            value={updateRepo}
+            onChange={(e) => {
+              setUpdateRepo(e.target.value)
+              setUpdateRepoState('idle')
+            }}
+            placeholder="например: anton/DI_Check"
+            className={inputCls}
+          />
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={saveUpdateRepo}
+            disabled={updateRepoState === 'saving'}
+            className={btnPrimaryCls}
+          >
+            {updateRepoState === 'saving' ? 'Сохранение…' : 'Сохранить'}
+          </button>
+          <StatusNote state={updateRepoState} />
+        </div>
+        <div>
+          <input
+            type="password"
+            value={updateToken}
+            onChange={(e) => {
+              setUpdateToken(e.target.value)
+              setUpdateTokenState('idle')
+            }}
+            placeholder={
+              settings.update.hasToken
+                ? 'Токен сохранён — введите новый, чтобы заменить'
+                : 'Токен GitHub (только для приватного репозитория)'
+            }
+            autoComplete="off"
+            className={inputCls}
+          />
+          <p className="mt-1 text-xs text-zinc-500">
+            Для публичного репозитория токен не нужен. Пустое значение удаляет токен.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={saveUpdateToken}
+            disabled={updateTokenState === 'saving'}
+            className={btnCls}
+          >
+            {updateTokenState === 'saving' ? 'Сохранение…' : 'Сохранить токен'}
+          </button>
+          <StatusNote state={updateTokenState} />
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={runUpdateCheck}
+            disabled={checkingUpdate}
+            className={btnCls}
+          >
+            {checkingUpdate ? 'Проверка…' : 'Проверить обновления'}
+          </button>
+          {updateInfo?.updateAvailable && (
+            <button
+              type="button"
+              onClick={runUpdateInstall}
+              disabled={installingUpdate}
+              className={btnPrimaryCls}
+            >
+              {installingUpdate ? 'Скачивание…' : `Скачать и установить ${updateInfo.latest}`}
+            </button>
+          )}
+        </div>
+        {updateInfo?.error && <p className="text-xs text-zinc-500">{updateInfo.error}</p>}
+        {updateInfo && !updateInfo.error && !updateInfo.updateAvailable && (
+          <p className="text-xs text-emerald-400">У вас последняя версия.</p>
+        )}
+        {installNote && <p className="text-xs text-amber-400">{installNote}</p>}
       </section>
     </div>
   )

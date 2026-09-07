@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, ApiError, type Job, type Settings } from './api'
+import { api, ApiError, type Job, type Settings, type UpdateInfo } from './api'
 import SettingsPanel from './components/SettingsPanel'
 import CheckPanel, { type CheckContext } from './components/CheckPanel'
 import Results from './components/Results'
@@ -15,6 +15,7 @@ export default function App() {
   const [job, setJob] = useState<Job | null>(null)
   const [starting, setStarting] = useState(false)
   const [noApiKey, setNoApiKey] = useState(false)
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
   const pollRef = useRef<number | null>(null)
   const pollFailuresRef = useRef(0)
 
@@ -25,6 +26,13 @@ export default function App() {
       .catch((e: unknown) =>
         setSettingsError(e instanceof Error ? e.message : 'Не удалось загрузить настройки'),
       )
+    // тихая автопроверка обновлений: результат виден в настройках
+    api
+      .checkUpdate()
+      .then((info) => {
+        if (!info.error && info.updateAvailable) setUpdateInfo(info)
+      })
+      .catch(() => {})
   }, [])
 
   const stopPolling = useCallback(() => {
@@ -174,7 +182,12 @@ export default function App() {
             <h2 className="border-b border-zinc-800 px-4 py-3 text-sm font-semibold text-zinc-200">
               Настройки
             </h2>
-            <SettingsPanel settings={settings} onUpdated={setSettings} onError={showError} />
+            <SettingsPanel
+              settings={settings}
+              onUpdated={setSettings}
+              onError={showError}
+              autoUpdateInfo={updateInfo}
+            />
           </aside>
         )}
 
