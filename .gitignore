@@ -10,9 +10,10 @@ build/
 DI_Check_portable.zip
 tools/
 
-# локальные тестовые артефакты
-test-*.docx
-backend/testdata/last_*
-backend/testdata/integration_*
-backend/testdata/batch_report.docx
-backend/testdata/fixed_*
+# docx (тестовые и реальные ДИ) в репозиторий не попадают никогда;
+# методология analiz-DI-goskontrakt-v4.docx — единственное исключение
+*.docx
+!analiz-DI-goskontrakt-v4.docx
+backend/testdata/*.zip
+backend/testdata/last_*.json
+backend/testdata/*_report.md
