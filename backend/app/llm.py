@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 
 import httpx
 
@@ -14,6 +15,27 @@ from .settings import PROVIDERS, get_api_key
 logger = logging.getLogger(__name__)
 
 TIMEOUT = httpx.Timeout(300.0, connect=30.0)
+
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """certifi + системные корни Windows: дефолтный набор в frozen-exe
+    на части машин не проходит верификацию (см. backend/app/updater.py)."""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        try:
+            import certifi
+
+            context = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            context = ssl.create_default_context()
+        try:
+            context.load_default_certs()
+        except Exception:
+            pass
+        _SSL_CONTEXT = context
+    return _SSL_CONTEXT
 
 MAX_ATTEMPTS = 3
 # Статусы, при которых имеет смысл повторить запрос (лимиты и сбои провайдера).
@@ -76,7 +98,7 @@ async def chat_completion(
     for attempt in range(1, MAX_ATTEMPTS + 1):
         resp = None
         try:
-            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=TIMEOUT, verify=_ssl_context()) as client:
                 resp = await client.post(url, json=payload, headers=headers)
         except httpx.TimeoutException:
             last_error = LLMError(f"Таймаут запроса к {cfg['name']} ({url})")
@@ -117,7 +139,7 @@ async def test_connection(provider: str, model: str | None = None) -> dict:
 
     headers = {"Authorization": f"Bearer {api_key}"}
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=TIMEOUT, verify=_ssl_context()) as client:
             resp = await client.get(f"{cfg['baseUrl']}/models", headers=headers)
             if resp.status_code == 200:
                 data = resp.json()

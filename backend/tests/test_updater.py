@@ -97,6 +97,17 @@ def test_check_404_is_not_a_crash():
     assert "приватный" in info["error"]
 
 
+def test_check_cert_error_is_friendly():
+    import ssl
+
+    def fail(url, token):
+        raise ssl.SSLCertVerificationError(1, "certificate verify failed")
+
+    info = check("owner/repo", None, fetch_json=fail)
+    assert info["error"] is not None
+    assert "сертификат" in info["error"]
+
+
 def test_check_network_error_is_error_string():
     def fail(url, token):
         raise OSError("no network")

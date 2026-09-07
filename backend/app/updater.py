@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import subprocess
 import tempfile
 import urllib.error
@@ -40,6 +41,34 @@ class UpdateError(Exception):
 
 # ---------- Инъекция внешнего мира ----------
 
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """SSL-контекст с явным набором корневых сертификатов.
+
+    Дефолтный контекст urllib в frozen-exe на части машин не находит корни
+    (CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate).
+    Собираем набор явно: certifi (вшивается в exe) + системные корни Windows
+    поверх (покрывает корпоративные прокси с перехватом HTTPS).
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+    try:
+        import certifi
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        context = ssl.create_default_context()
+    try:
+        context.load_default_certs()  # добавит корни Windows к certifi
+    except Exception:
+        pass
+    _SSL_CONTEXT = context
+    return context
+
+
 def _headers(token: str | None, *, octet_stream: bool) -> dict:
     headers = {
         "User-Agent": "DI_Check-updater",
@@ -53,13 +82,13 @@ def _headers(token: str | None, *, octet_stream: bool) -> dict:
 
 def _default_fetch_json(url: str, token: str | None) -> dict:
     req = urllib.request.Request(url, headers=_headers(token, octet_stream=False))
-    with urllib.request.urlopen(req, timeout=CHECK_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=CHECK_TIMEOUT, context=_ssl_context()) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def _default_download(url: str, token: str | None, dest: str) -> None:
     req = urllib.request.Request(url, headers=_headers(token, octet_stream=True))
-    with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp, open(dest, "wb") as f:
+    with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT, context=_ssl_context()) as resp, open(dest, "wb") as f:
         while chunk := resp.read(1 << 20):
             f.write(chunk)
 
@@ -126,6 +155,12 @@ def check(
                 "(для приватного нужен токен в настройках)",
             }
         return {**result, "error": f"GitHub вернул HTTP {e.code}"}
+    except ssl.SSLCertVerificationError as e:
+        return {
+            **result,
+            "error": "Не удалось проверить сертификат GitHub — возможно, антивирус или "
+            f"корпоративный прокси перехватывают HTTPS ({e})",
+        }
     except Exception as e:  # сеть, DNS, таймаут, битый JSON — всё сюда
         return {**result, "error": str(e)}
 

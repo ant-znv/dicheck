@@ -417,7 +417,20 @@ export default function SettingsPanel({ settings, onUpdated, onError, autoUpdate
             </button>
           )}
         </div>
-        {updateInfo?.error && <p className="text-xs text-zinc-500">{updateInfo.error}</p>}
+        {updateInfo?.error && (
+          <p className="text-xs text-zinc-500">
+            {updateInfo.error}{' '}
+            <a
+              href="https://github.com/ant-znv/dicheck/releases"
+              target="_blank"
+              rel="noreferrer"
+              className="text-sky-400 underline underline-offset-2 hover:text-sky-300"
+            >
+              Открыть страницу релизов
+            </a>{' '}
+            — оттуда всегда можно скачать установщик вручную.
+          </p>
+        )}
         {updateInfo && !updateInfo.error && !updateInfo.updateAvailable && (
           <p className="text-xs text-emerald-400">У вас последняя версия.</p>
         )}
