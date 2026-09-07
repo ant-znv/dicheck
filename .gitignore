@@ -8,6 +8,7 @@ frontend/dist/
 build/
 /dist/
 DI_Check_portable.zip
+tools/
 
 # локальные тестовые артефакты
 test-*.docx

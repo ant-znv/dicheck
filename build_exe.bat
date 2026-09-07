@@ -44,8 +44,28 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM --- 5. Installer (Inno Setup, esli nayden) ---
+set "ISCC="
+if exist "tools\innosetup\ISCC.exe" set "ISCC=tools\innosetup\ISCC.exe"
+if not defined ISCC if exist "%ProgramFiles%\Inno Setup 7\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Setup 7\ISCC.exe"
+if not defined ISCC if exist "%ProgramFiles(x86)%\Inno Setup 7\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 7\ISCC.exe"
+if not defined ISCC if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+if defined ISCC (
+    echo [DI_Check] Sborka ustanovshchika: "%ISCC%"...
+    "%ISCC%" DI_Check.iss
+    if errorlevel 1 (
+        echo [DI_Check] Oshibka sborki ustanovshchika.
+        pause
+        exit /b 1
+    )
+    echo   dist\installer\DI_Check_setup.exe
+) else (
+    echo [DI_Check] Inno Setup ne nayden - ustanovshchik propushchen, portable zip gotov.
+)
+
 echo.
 echo [DI_Check] Gotovo:
 echo   Papka:        dist\DI_Check\  (zapustit DI_Check.exe)
 echo   Arhiv:        DI_Check_portable.zip  (rasprostranenie)
+if defined ISCC echo   Ustanovshchik: dist\installer\DI_Check_setup.exe
 endlocal

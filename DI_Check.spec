@@ -50,6 +50,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=True,
+    icon="resources/app.ico",
 )
 
 coll = COLLECT(
