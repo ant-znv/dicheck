@@ -17,3 +17,4 @@ tools/
 backend/testdata/*.zip
 backend/testdata/last_*.json
 backend/testdata/*_report.md
+ispravlennye_di.zip
