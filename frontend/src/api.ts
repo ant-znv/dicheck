@@ -102,7 +102,44 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T
 }
 
-async function requestBlob(path: string, init?: RequestInit): Promise<Blob> {
+/** Единый текст ошибки для тостов: message + detail (если сервер его прислал). */
+export function formatError(e: unknown, fallback: string): string {
+  if (e instanceof ApiError) return e.detail ? `${e.message}: ${e.detail}` : e.message
+  if (e instanceof Error) return e.message
+  return fallback
+}
+
+/** Имя файла из заголовка Content-Disposition (RFC 5987 filename* и обычный filename=). */
+function filenameFromDisposition(header: string | null): string | null {
+  if (!header) return null
+  const star = /filename\*\s*=\s*(?:utf-8|UTF-8)''([^;]+)/i.exec(header)
+  if (star) {
+    const raw = star[1].trim().replace(/^"|"$/g, '')
+    try {
+      return decodeURIComponent(raw)
+    } catch {
+      return raw
+    }
+  }
+  const plain = /filename\s*=\s*(?:"([^"]*)"|([^;]+))/i.exec(header)
+  if (plain) {
+    const raw = (plain[1] ?? plain[2]).trim()
+    try {
+      return decodeURIComponent(raw)
+    } catch {
+      return raw
+    }
+  }
+  return null
+}
+
+export interface DownloadedFile {
+  blob: Blob
+  /** Имя файла из Content-Disposition, если сервер его прислал. */
+  filename: string | null
+}
+
+async function requestBlob(path: string, init?: RequestInit): Promise<DownloadedFile> {
   let res: Response
   try {
     res = await fetch(path, init)
@@ -113,7 +150,8 @@ async function requestBlob(path: string, init?: RequestInit): Promise<Blob> {
     const detail = await parseErrorDetail(res)
     throw new ApiError(res.status, detail, `Ошибка сервера (${res.status})`)
   }
-  return res.blob()
+  const blob = await res.blob()
+  return { blob, filename: filenameFromDisposition(res.headers.get('Content-Disposition')) }
 }
 
 function jsonInit(method: string, body: unknown): RequestInit {
@@ -171,6 +209,6 @@ export const api = {
   fixAll: (jobId: string, items: FixAllItem[]) =>
     requestBlob(`/api/jobs/${jobId}/fix-all`, jsonInit('POST', { items })),
 
-  exportUrl: (jobId: string, format: 'md' | 'html' | 'docx') =>
-    `/api/jobs/${jobId}/export?format=${format}`,
+  exportBlob: (jobId: string, format: 'md' | 'html' | 'docx') =>
+    requestBlob(`/api/jobs/${jobId}/export?format=${format}`),
 }

@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { api, type Settings, type UpdateInfo } from '../api'
+import { useEffect, useMemo, useState } from 'react'
+import { api, formatError, type Settings, type UpdateInfo } from '../api'
 
 type SaveState = 'idle' | 'saving' | 'saved' | 'error'
 
@@ -48,6 +48,15 @@ export default function SettingsPanel({ settings, onUpdated, onError, autoUpdate
   const [installingUpdate, setInstallingUpdate] = useState(false)
   const [installNote, setInstallNote] = useState<string | null>(null)
 
+  // autoUpdateInfo приходит асинхронно (тихая автопроверка при старте приложения):
+  // догоняем prop, если он появился/изменился после маунта панели.
+  useEffect(() => {
+    if (autoUpdateInfo) setUpdateInfo(autoUpdateInfo)
+  }, [autoUpdateInfo])
+  // prompt/provider/model намеренно НЕ синхронизируем с props: settings меняется
+  // только через сохранения из этой же панели, рассинхрона нет, а синхронизация
+  // могла бы затирать недосохранённое редактирование пользователя.
+
   const currentProvider = useMemo(
     () => settings.providers.find((p) => p.id === provider) ?? settings.providers[0],
     [settings.providers, provider],
@@ -58,7 +67,7 @@ export default function SettingsPanel({ settings, onUpdated, onError, autoUpdate
     return [...new Set(all)]
   }, [currentProvider, fetchedModels])
 
-  const errorText = (e: unknown) => (e instanceof Error ? e.message : 'Неизвестная ошибка')
+  const errorText = (e: unknown) => formatError(e, 'Неизвестная ошибка')
 
   const saveSelection = async () => {
     setSelectionState('saving')
@@ -178,7 +187,7 @@ export default function SettingsPanel({ settings, onUpdated, onError, autoUpdate
       )
       setUpdateInfo(null)
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'Не удалось запустить обновление')
+      onError(formatError(e, 'Не удалось запустить обновление'))
     } finally {
       setInstallingUpdate(false)
     }
@@ -197,7 +206,10 @@ export default function SettingsPanel({ settings, onUpdated, onError, autoUpdate
             id="provider"
             value={provider}
             onChange={(e) => {
+              const nextProvider = settings.providers.find((p) => p.id === e.target.value)
               setProvider(e.target.value)
+              // Модель предыдущего провайдера невалидна для нового — подставляем дефолтную.
+              if (nextProvider) setModel(nextProvider.defaultModels[0] ?? '')
               setSelectionState('idle')
               setTestResult(null)
               setFetchedModels([])

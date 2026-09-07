@@ -8,6 +8,9 @@ export interface CheckContext {
 
 const ACCEPTED = ['.docx', '.doc', '.pdf', '.txt', '.md', '.odt']
 const ACCEPT_ATTR = ACCEPTED.join(',')
+const MAX_FILE_SIZE = 20 * 1024 * 1024
+const MAX_FILES = 20
+const MAX_FILE_SIZE_MB = Math.round(MAX_FILE_SIZE / (1024 * 1024))
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} Б`
@@ -22,14 +25,16 @@ function isAccepted(file: File): boolean {
 
 interface Props {
   starting: boolean
+  /** Идёт проверка (active job в статусе running) — повторный запуск заблокирован. */
+  checking: boolean
   onStart: (files: File[], ctx: CheckContext) => void
-  onRejected: (names: string[]) => void
+  onRejected: (message: string) => void
 }
 
 const inputCls =
   'w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-sky-500'
 
-export default function CheckPanel({ starting, onStart, onRejected }: Props) {
+export default function CheckPanel({ starting, checking, onStart, onRejected }: Props) {
   const [files, setFiles] = useState<File[]>([])
   const [dragOver, setDragOver] = useState(false)
   const [ctxOpen, setCtxOpen] = useState(false)
@@ -40,20 +45,44 @@ export default function CheckPanel({ starting, onStart, onRejected }: Props) {
   })
   const inputRef = useRef<HTMLInputElement>(null)
 
+  // Клиентская валидация лимитов сервера (20 файлов, 20 МБ/файл) — до отправки на бэкенд.
   const addFiles = (incoming: Iterable<File>) => {
+    const badFormat: string[] = []
+    const tooBig: string[] = []
     const accepted: File[] = []
-    const rejected: string[] = []
     for (const f of incoming) {
-      if (isAccepted(f)) accepted.push(f)
-      else rejected.push(f.name)
+      if (!isAccepted(f)) {
+        badFormat.push(f.name)
+        continue
+      }
+      if (f.size > MAX_FILE_SIZE) {
+        tooBig.push(`${f.name} (${formatSize(f.size)})`)
+        continue
+      }
+      accepted.push(f)
     }
-    if (rejected.length > 0) onRejected(rejected)
-    if (accepted.length > 0) {
-      setFiles((prev) => {
-        const existing = new Set(prev.map((f) => `${f.name}:${f.size}`))
-        const fresh = accepted.filter((f) => !existing.has(`${f.name}:${f.size}`))
-        return [...prev, ...fresh]
-      })
+    if (badFormat.length > 0) {
+      onRejected(`Неподдерживаемый формат: ${badFormat.join(', ')}`)
+    }
+    if (tooBig.length > 0) {
+      onRejected(
+        `Файл${tooBig.length > 1 ? 'ы' : ''} больше ${MAX_FILE_SIZE_MB} МБ не будет${tooBig.length > 1 ? 'ы' : ''} отправлен${tooBig.length > 1 ? 'ы' : ''}: ${tooBig.join(', ')}`,
+      )
+    }
+
+    const existing = new Set(files.map((f) => `${f.name}:${f.size}`))
+    const fresh = accepted.filter((f) => !existing.has(`${f.name}:${f.size}`))
+    const room = MAX_FILES - files.length
+    if (fresh.length > room) {
+      const overflow = fresh.length - room
+      onRejected(
+        overflow === 1
+          ? `Можно проверить не более ${MAX_FILES} файлов за раз — 1 файл не добавлен.`
+          : `Можно проверить не более ${MAX_FILES} файлов за раз — лишние ${overflow} не добавлены.`,
+      )
+    }
+    if (room > 0 && fresh.length > 0) {
+      setFiles([...files, ...fresh.slice(0, room)])
     }
   }
 
@@ -68,7 +97,7 @@ export default function CheckPanel({ starting, onStart, onRejected }: Props) {
   }
 
   const handleStart = () => {
-    if (files.length === 0 || starting) return
+    if (files.length === 0 || starting || checking) return
     onStart(files, ctx)
   }
 
@@ -115,7 +144,8 @@ export default function CheckPanel({ starting, onStart, onRejected }: Props) {
           </button>
         </p>
         <p className="mt-1 text-xs text-zinc-500">
-          Поддерживаются: {ACCEPTED.join(', ')}
+          Поддерживаются: {ACCEPTED.join(', ')} · до {MAX_FILES} файлов, до {MAX_FILE_SIZE_MB} МБ
+          каждый
         </p>
         <input
           ref={inputRef}
@@ -224,14 +254,21 @@ export default function CheckPanel({ starting, onStart, onRejected }: Props) {
       <button
         type="button"
         onClick={handleStart}
-        disabled={files.length === 0 || starting}
+        disabled={files.length === 0 || starting || checking}
+        title={
+          checking
+            ? 'Идёт проверка — дождитесь её завершения, чтобы запустить новую'
+            : undefined
+        }
         className="w-full cursor-pointer rounded-xl bg-sky-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
       >
         {starting
           ? 'Запуск…'
-          : files.length > 0
-            ? `Запустить проверку (${files.length} ${plural(files.length)})`
-            : 'Запустить проверку'}
+          : checking
+            ? 'Идёт проверка…'
+            : files.length > 0
+              ? `Запустить проверку (${files.length} ${plural(files.length)})`
+              : 'Запустить проверку'}
       </button>
     </div>
   )

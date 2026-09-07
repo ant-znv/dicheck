@@ -1,7 +1,21 @@
 import { useEffect, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { api, ApiError, type Edit, type Job, type JobResult, type Verdict } from '../api'
+import { api, formatError, type Edit, type Job, type JobResult, type Verdict } from '../api'
+
+type ExportFormat = 'md' | 'html' | 'docx'
+
+/** Скачивание blob как файла (создаём временную ссылку и сразу освобождаем). */
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
 
 const VERDICT_META: Record<Verdict, { label: string; cls: string }> = {
   ok: { label: 'OK', cls: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400' },
@@ -70,19 +84,11 @@ function EditsSection({
   const handleFix = async () => {
     setFixing(true)
     try {
-      const blob = await api.fixDocument(jobId, resultIndex, [...checked])
-      const base = filename.replace(/\.[^.]+$/, '')
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${base}_исправленная.docx`
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      URL.revokeObjectURL(url)
+      const { blob, filename: serverName } = await api.fixDocument(jobId, resultIndex, [...checked])
+      const base = (serverName ?? filename).replace(/\.[^.]+$/, '')
+      downloadBlob(blob, `${base}_исправленная.docx`)
     } catch (e) {
-      if (e instanceof ApiError && e.detail) onError(e.detail)
-      else onError(e instanceof Error ? e.message : 'Не удалось сформировать исправленный документ')
+      onError(formatError(e, 'Не удалось сформировать исправленный документ'))
     } finally {
       setFixing(false)
     }
@@ -193,6 +199,7 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
   const [fixingAll, setFixingAll] = useState(false)
   const [fixAllSummary, setFixAllSummary] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
+  const [exporting, setExporting] = useState<ExportFormat | null>(null)
 
   // Если выбранный индекс вышел за пределы результатов — сбрасываем выбор
   useEffect(() => {
@@ -215,8 +222,7 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
     try {
       await api.cancelJob(job.id)
     } catch (e) {
-      if (e instanceof ApiError && e.detail) onError(e.detail)
-      else onError(e instanceof Error ? e.message : 'Не удалось отменить проверку')
+      onError(formatError(e, 'Не удалось отменить проверку'))
     } finally {
       setCancelling(false)
     }
@@ -243,26 +249,32 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
     }))
     .filter((item) => item.editIds.length > 0)
 
+  // Скачивание общего отчёта: blob + обработка ошибок тостом
+  // (прямая <a href> молча сохранила бы JSON с ошибкой при 404/410).
+  const handleExport = async (format: ExportFormat) => {
+    setExporting(format)
+    try {
+      const { blob, filename } = await api.exportBlob(job.id, format)
+      downloadBlob(blob, filename ?? `report.${format}`)
+    } catch (e) {
+      onError(formatError(e, 'Не удалось скачать отчёт'))
+    } finally {
+      setExporting(null)
+    }
+  }
+
   const handleFixAll = async () => {
     setFixingAll(true)
     setFixAllSummary(null)
     try {
-      const blob = await api.fixAll(job.id, fixAllItems)
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = 'ispravlennye_di.zip'
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      URL.revokeObjectURL(url)
+      const { blob, filename } = await api.fixAll(job.id, fixAllItems)
+      downloadBlob(blob, filename ?? 'ispravlennye_di.zip')
       setFixAllSummary(
         `Отправлено на исправление: ${fixAllItems.length} файл(ов). ` +
           'Если какие-то файлы не удалось исправить, причины перечислены в _errors.txt внутри архива.',
       )
     } catch (e) {
-      if (e instanceof ApiError && e.detail) onError(e.detail)
-      else onError(e instanceof Error ? e.message : 'Не удалось выполнить пакетное исправление')
+      onError(formatError(e, 'Не удалось выполнить пакетное исправление'))
     } finally {
       setFixingAll(false)
     }
@@ -304,27 +316,33 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-sm text-zinc-400">Скачать общий отчёт:</span>
-              <a
-                href={api.exportUrl(job.id, 'docx')}
-                download
-                className="rounded-lg bg-sky-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-sky-500"
+              <button
+                type="button"
+                onClick={() => void handleExport('docx')}
+                disabled={exporting !== null}
+                className="flex cursor-pointer items-center gap-2 rounded-lg bg-sky-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
               >
+                {exporting === 'docx' && <Spinner />}
                 DOCX
-              </a>
-              <a
-                href={api.exportUrl(job.id, 'md')}
-                download
-                className="rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700"
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleExport('md')}
+                disabled={exporting !== null}
+                className="flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
               >
+                {exporting === 'md' && <Spinner />}
                 MD
-              </a>
-              <a
-                href={api.exportUrl(job.id, 'html')}
-                download
-                className="rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700"
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleExport('html')}
+                disabled={exporting !== null}
+                className="flex cursor-pointer items-center gap-2 rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-zinc-100 transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
               >
+                {exporting === 'html' && <Spinner />}
                 HTML
-              </a>
+              </button>
             </div>
             <button
               type="button"
