@@ -28,6 +28,13 @@ a = Analysis(
         "PIL",
         # pywin32: чтение старых .doc через Word COM
         "win32timezone",
+        # окно приложения (pywebview/WebView2 через pythonnet)
+        "webview",
+        "webview.platforms.edgechromium",
+        "webview.platforms.winforms",
+        "clr",
+        "clr_loader",
+        "pythonnet",
     ],
     excludes=["tkinter", "matplotlib"],
     noarchive=False,
@@ -45,7 +52,8 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    # окно приложения без консоли; логи — в %APPDATA%\DI_Check\logs
+    console=False,
     icon="resources/app.ico",
 )
 

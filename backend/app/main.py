@@ -24,13 +24,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import extractors, llm, settings, updater
+from .logsetup import setup_logging
 
-logger = logging.getLogger("di_check")
+# Логи настраивает точка входа (run.py); в dev (uvicorn напрямую) — консоль.
 if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    setup_logging(console=True)
+logger = logging.getLogger("di_check")
 
 app = FastAPI(title="DI_Check")
 
