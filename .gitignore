@@ -16,3 +16,6 @@ backend/testdata/*.zip
 backend/testdata/last_*.json
 backend/testdata/*_report.md
 ispravlennye_di.zip
+
+# служебные данные ZCode (планы/заметки сессий) — в гит не попадают
+.zcode/
