@@ -37,7 +37,8 @@ def isolated_jobs():
 
 @pytest.fixture()
 def client():
-    with TestClient(main.app) as test_client:
+    # base_url с loopback-host: иначе loopback-guard main.py режет запросы по Host
+    with TestClient(main.app, base_url="http://127.0.0.1") as test_client:
         yield test_client
 
 

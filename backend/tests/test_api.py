@@ -305,7 +305,32 @@ def test_check_limits(
     assert "empty_file" in resp.json()["detail"]
 
 
-# ---------- 8. Выгрузка просроченных джоб ----------
+# ---------- 8. Magic-байты ----------
+
+def test_check_rejects_fake_binary_format(client, with_api_key, make_fake_llm):
+    make_fake_llm(["Отчёт."])
+    resp = client.post(
+        "/api/check",
+        files={"files": ("x.docx", "это точно не docx, просто текст".encode(), DOCX_MIME)},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "invalid_file_format: x.docx"
+
+
+def test_check_text_formats_skip_magic_check(
+    client, with_api_key, make_fake_llm
+):
+    """Для .txt/.md проверки magic-байтов нет."""
+    make_fake_llm(["Отчёт."])
+    resp = client.post(
+        "/api/check",
+        files={"files": ("note.md", "совсем не magic, просто текст".encode(), "text/markdown")},
+    )
+    assert resp.status_code == 200
+    poll_job(client, resp.json()["jobId"], "done")
+
+
+# ---------- 9. Выгрузка просроченных джоб ----------
 
 def test_expired_jobs_evicted_on_check(
     client, with_api_key, make_fake_llm, make_docx_bytes, make_job
@@ -327,7 +352,7 @@ def test_expired_jobs_evicted_on_check(
     assert new_id in main._jobs
 
 
-# ---------- 9. GET /api/jobs/{id}: 404 и отсутствие служебных полей ----------
+# ---------- 10. GET /api/jobs/{id}: 404 и отсутствие служебных полей ----------
 
 def test_get_job_missing_and_no_internal_fields(client, make_job):
     assert client.get("/api/jobs/missing00").status_code == 404
@@ -352,7 +377,7 @@ def test_get_job_missing_and_no_internal_fields(client, make_job):
         assert secret not in raw
 
 
-# ---------- 10. Обрезка длинного текста ----------
+# ---------- 11. Обрезка длинного текста ----------
 
 def test_long_text_truncated(
     client, with_api_key, make_fake_llm, make_docx_bytes, monkeypatch

@@ -207,8 +207,16 @@ def _from_doc(data: bytes) -> str:
                 "Не удалось запустить Microsoft Word для чтения .doc "
                 f"({e}). Сконвертируйте файл в .docx и загрузите снова"
             )
+        # Запрет макросов в недоверенных .doc: 3 = msoAutomationSecurityForceDisable
+        try:
+            word.AutomationSecurity = 3
+        except Exception as e:
+            logger.warning("Word AutomationSecurity недоступен (%s), продолжаем", e)
+        try:
+            word.DisplayAlerts = 0
+        except Exception as e:
+            logger.warning("Word DisplayAlerts недоступен (%s), продолжаем", e)
         word.Visible = False
-        word.DisplayAlerts = 0
         try:
             doc = word.Documents.Open(
                 str(src), ReadOnly=True, ConfirmConversions=False,

@@ -13,13 +13,13 @@ import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from docx import Document
 from docx.text.paragraph import Paragraph
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -45,6 +45,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- CSRF/DNS-rebinding защита ----------
+# Сервер слушает только 127.0.0.1, поэтому и Origin, и Host должны указывать
+# на loopback: чужой Origin — CSRF («простые» POST без preflight летят мимо
+# CORS), чужой Host без Origin — DNS-rebinding. Middleware добавлен ПОСЛЕ
+# CORSMiddleware, чтобы быть внешним и отдавать 403 до обработки CORS.
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _hostname_of(value: str) -> str | None:
+    """Hostname без схемы и порта: для Origin ('http://h:p') и Host ('h:p')."""
+    if not value:
+        return None
+    raw = value if "//" in value else f"//{value}"
+    try:
+        return urlsplit(raw).hostname
+    except ValueError:
+        return None
+
+
+@app.middleware("http")
+async def _loopback_only(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if origin is not None and _hostname_of(origin) not in _LOOPBACK_HOSTS:
+        return JSONResponse(status_code=403, content={"detail": "forbidden_origin"})
+    if _hostname_of(request.headers.get("host", "")) not in _LOOPBACK_HOSTS:
+        return JSONResponse(status_code=403, content={"detail": "forbidden_host"})
+    return await call_next(request)
+
 # Джобы в памяти
 _jobs: dict[str, dict] = {}
 _semaphore = asyncio.Semaphore(3)
@@ -57,6 +86,16 @@ MAX_FILE_SIZE = 20 * 1024 * 1024  # байт на файл
 MAX_TEXT_CHARS = 120_000          # предел текста ДИ в user-message
 JOB_TTL_SECONDS = 24 * 3600       # сколько жить завершённой джобе
 MAX_JOBS = 50                     # максимум джоб в памяти
+FILE_TTL_SECONDS = 3600           # сколько хранить байты/текст завершённой джобы
+MAX_TOTAL_BYTES = 500 * 1024 * 1024  # суммарный лимит payload-байтов по всем джобам
+
+# Магические байты бинарных форматов (расширение должно соответствовать содержимому)
+_FILE_MAGIC = {
+    ".docx": b"PK\x03\x04",                      # zip-контейнер (как и .odt)
+    ".odt": b"PK\x03\x04",
+    ".doc": b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",  # OLE2
+    ".pdf": b"%PDF",
+}
 
 if getattr(sys, "frozen", False):
     # PyInstaller: ресурсы распакованы в sys._MEIPASS (в onedir — каталог _internal)
@@ -482,6 +521,8 @@ async def _run_job(job_id: str, files: list[tuple[str, bytes]], user_fields: dic
         job["status"] = "error"
     else:
         job["status"] = "done"
+    job["_finished_at"] = time.monotonic()
+    _evict_job_payloads()
     logger.info("Джоба %s завершена, статус: %s", job_id, job["status"])
 
 
@@ -508,6 +549,45 @@ def _evict_expired_jobs() -> None:
         logger.info(
             "Выгружена старая джоба %s (превышен лимит %d джоб)", oldest["id"], MAX_JOBS
         )
+
+
+def _payload_bytes(job: dict) -> int:
+    """Суммарный размер payload'ов джобы: байты файлов + тексты (utf-8)."""
+    return (
+        sum(len(data) for data in job["_files"].values())
+        + sum(len(text.encode("utf-8")) for text in job["_texts"].values())
+    )
+
+
+def _evict_job_payloads() -> None:
+    """Выгружает payload'ы завершённых джоб (байты файлов и тексты).
+
+    Отчёты/results остаются на месте: GET /api/jobs/{id} и экспорт работают.
+    (а) у джоб, завершённых дольше FILE_TTL_SECONDS назад; (б) пока суммарный
+    объём payload-байтов превышает MAX_TOTAL_BYTES — у самых старых завершённых
+    (по created_at). Запущенные джобы не трогаются.
+    """
+    now = time.monotonic()
+    candidates = sorted(
+        (
+            j for j in _jobs.values()
+            if j["status"] != "running" and (j["_files"] or j["_texts"])
+        ),
+        key=lambda j: j["created_at"],
+    )
+    total = sum(_payload_bytes(j) for j in _jobs.values())
+    evicted: list[dict] = []
+    for j in candidates:
+        finished_at = j.get("_finished_at")
+        expired = finished_at is not None and now - finished_at > FILE_TTL_SECONDS
+        if expired or total > MAX_TOTAL_BYTES:
+            evicted.append(j)
+            total -= _payload_bytes(j)
+    for j in evicted:
+        j["_files"].clear()
+        j["_texts"].clear()
+    if evicted:
+        logger.info("Выгружены payload'ы (байты/тексты) джоб: %d", len(evicted))
 
 
 @app.post("/api/check")
@@ -538,16 +618,30 @@ async def create_check(
                 status_code=400,
                 detail=f"unsupported_format: {f.filename}",
             )
-        data = await f.read()
+        chunks: list[bytes] = []
+        total_size = 0
+        while True:
+            chunk = await f.read(1024 * 1024)  # 1 МБ — читаем чанками, не целиком
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"file_too_large: {f.filename} "
+                        f"(максимум {MAX_FILE_SIZE // (1024 * 1024)} МБ)"
+                    ),
+                )
+            chunks.append(chunk)
+        data = b"".join(chunks)
         if not data:
             raise HTTPException(status_code=400, detail=f"empty_file: {f.filename}")
-        if len(data) > MAX_FILE_SIZE:
+        magic = _FILE_MAGIC.get(ext)
+        if magic is not None and not data.startswith(magic):
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"file_too_large: {f.filename} "
-                    f"(максимум {MAX_FILE_SIZE // (1024 * 1024)} МБ)"
-                ),
+                detail=f"invalid_file_format: {f.filename}",
             )
         payloads.append((f.filename, data))
         results.append(
@@ -563,6 +657,7 @@ async def create_check(
         )
 
     _evict_expired_jobs()
+    _evict_job_payloads()
 
     job_id = uuid.uuid4().hex[:12]
     _jobs[job_id] = {
@@ -835,15 +930,20 @@ async def _perform_fix(job: dict, result_index: int, edit_ids: list[str]) -> tup
 
     if not edit_ids:
         raise FixError("empty_edit_ids")
-    source_text = job.get("_texts", {}).get(result_index)
-    if not source_text:
-        raise FixError("no_source_text")
 
     by_id = {e["id"]: e for e in (result.get("edits") or [])}
     unknown = [eid for eid in edit_ids if eid not in by_id]
     if unknown:
         raise FixError(f"unknown_edit_ids: {', '.join(unknown)}")
     chosen = [by_id[eid] for eid in edit_ids]
+
+    if result_index not in job["_files"]:
+        # payload (байты/текст) выгружен из памяти (_evict_job_payloads) —
+        # правки по этой джобе больше невозможны
+        raise HTTPException(status_code=410, detail="payload_expired")
+    source_text = job.get("_texts", {}).get(result_index)
+    if not source_text:
+        raise FixError("no_source_text")
 
     # 1) детерминированная часть: дословная цитата, уникальная в исходном тексте
     rest: list[dict] = []
