@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  ApiError,
   api,
   formatError,
   type HistoryDocumentSummary,
+  type HistoryTemplateInfo,
 } from '../api'
 import {
   Spinner,
@@ -29,6 +31,12 @@ function displayName(d: HistoryDocumentSummary): string {
   return d.position.trim() || d.title
 }
 
+/** Размер шаблона для строки статуса. */
+function formatSizeKb(bytes: number): string {
+  if (bytes < 1024) return `${bytes} Б`
+  return `${(bytes / 1024).toFixed(1)} КБ`
+}
+
 export default function HistoryView({ onError, onSuccess }: Props) {
   const [items, setItems] = useState<HistoryDocumentSummary[]>([])
   const [total, setTotal] = useState(0)
@@ -41,6 +49,13 @@ export default function HistoryView({ onError, onSuccess }: Props) {
   const [openDocId, setOpenDocId] = useState<number | null>(null)
   const [bulkFilling, setBulkFilling] = useState(false)
   const [exporting, setExporting] = useState(false)
+  // Шаблон выгрузки: статус (null = ещё не загружен), панель, файл на загрузку
+  const [tpl, setTpl] = useState<HistoryTemplateInfo | null>(null)
+  const [tplOpen, setTplOpen] = useState(false)
+  const [tplLoading, setTplLoading] = useState(false)
+  const [tplUploading, setTplUploading] = useState(false)
+  const [tplDeleting, setTplDeleting] = useState(false)
+  const [tplFile, setTplFile] = useState<File | null>(null)
   // Занятые строки (скачивание/удаление), чтобы дублировать клики
   const [busyRows, setBusyRows] = useState<ReadonlySet<number>>(new Set())
 
@@ -90,6 +105,22 @@ export default function HistoryView({ onError, onSuccess }: Props) {
   }, [load, reloadTick])
 
   const refresh = () => setReloadTick((t) => t + 1)
+
+  const loadTemplate = useCallback(async () => {
+    setTplLoading(true)
+    try {
+      setTpl(await api.getTemplate())
+    } catch (e) {
+      onError(formatError(e, 'Не удалось получить статус шаблона выгрузки'))
+    } finally {
+      setTplLoading(false)
+    }
+  }, [onError])
+
+  // Статус шаблона нужен сразу: от него зависят подпись и поведение кнопки выгрузки.
+  useEffect(() => {
+    void loadTemplate()
+  }, [loadTemplate])
 
   const markBusy = (id: number, busy: boolean) =>
     setBusyRows((prev) => {
@@ -146,13 +177,67 @@ export default function HistoryView({ onError, onSuccess }: Props) {
 
   const handleExportFixed = async () => {
     setExporting(true)
+    const useTemplate = tpl?.exists === true
     try {
-      const { blob, filename } = await api.exportHistoryFixed()
+      const { blob, filename } = await api.exportHistoryFixed(undefined, { template: useTemplate })
       downloadBlob(blob, filename ?? 'ispravlennye_di.zip')
     } catch (e) {
-      onError(formatError(e, 'Не удалось выгрузить исправленные документы'))
+      // Шаблон могли удалить параллельно (409 no_template) — повторяем без шаблона.
+      if (useTemplate && e instanceof ApiError && e.status === 409) {
+        try {
+          const { blob, filename } = await api.exportHistoryFixed()
+          downloadBlob(blob, filename ?? 'ispravlennye_di.zip')
+          setTpl({ exists: false })
+          onSuccess('Шаблон не найден — выполнена обычная выгрузка без шаблона')
+        } catch (e2) {
+          onError(formatError(e2, 'Не удалось выгрузить исправленные документы'))
+        }
+      } else {
+        onError(formatError(e, 'Не удалось выгрузить исправленные документы'))
+      }
     } finally {
       setExporting(false)
+    }
+  }
+
+  const handleUploadTemplate = async () => {
+    if (!tplFile || tplUploading) return
+    if (!tplFile.name.toLowerCase().endsWith('.docx')) {
+      onError('Шаблон должен быть файлом .docx')
+      return
+    }
+    setTplUploading(true)
+    try {
+      const res = await api.uploadTemplate(tplFile)
+      setTpl({ exists: true, size: res.size, keys: res.keys })
+      setTplFile(null)
+      const keys = res.keys.length > 0 ? res.keys.join(', ') : 'не найдено'
+      if (!res.keys.includes('ТЕКСТ')) {
+        onError(
+          `Шаблон загружен, но ключа ТЕКСТ в нём нет — без {{ТЕКСТ}} содержимое ДИ не вставится. Найденные ключи: ${keys}`,
+        )
+      } else {
+        onSuccess(`Шаблон загружен. Найденные ключи: ${keys}`)
+      }
+    } catch (e) {
+      onError(formatError(e, 'Не удалось загрузить шаблон'))
+    } finally {
+      setTplUploading(false)
+    }
+  }
+
+  const handleDeleteTemplate = async () => {
+    if (!window.confirm('Удалить шаблон выгрузки? Исправленные ДИ будут выгружаться как есть.'))
+      return
+    setTplDeleting(true)
+    try {
+      await api.deleteTemplate()
+      setTpl({ exists: false })
+      onSuccess('Шаблон выгрузки удалён')
+    } catch (e) {
+      onError(formatError(e, 'Не удалось удалить шаблон'))
+    } finally {
+      setTplDeleting(false)
     }
   }
 
@@ -206,6 +291,14 @@ export default function HistoryView({ onError, onSuccess }: Props) {
           </button>
           <button
             type="button"
+            onClick={() => setTplOpen((v) => !v)}
+            aria-expanded={tplOpen}
+            className={historyBtnCls}
+          >
+            Шаблон выгрузки…
+          </button>
+          <button
+            type="button"
             onClick={() => void handleExportFixed()}
             disabled={exporting || fixedTotal === 0}
             title={
@@ -214,10 +307,108 @@ export default function HistoryView({ onError, onSuccess }: Props) {
             className={historyBtnPrimaryCls}
           >
             {exporting && <Spinner />}
-            {exporting ? 'Формируется архив…' : 'Выгрузить исправленные (ZIP)'}
+            {exporting
+              ? 'Формируется архив…'
+              : tpl?.exists
+                ? 'Выгрузить исправленные (ZIP, по шаблону)'
+                : 'Выгрузить исправленные (ZIP)'}
           </button>
         </div>
       </div>
+
+      {/* Панель шаблона выгрузки */}
+      {tplOpen && (
+        <div className="space-y-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold text-zinc-200">Шаблон выгрузки</h3>
+            <button
+              type="button"
+              onClick={() => setTplOpen(false)}
+              aria-label="Закрыть панель шаблона"
+              className="cursor-pointer text-zinc-500 transition-colors hover:text-zinc-200"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+              >
+                <path d="M3 3l10 10M13 3L3 13" />
+              </svg>
+            </button>
+          </div>
+
+          {tplLoading ? (
+            <div className="flex items-center gap-2 text-sm text-zinc-400">
+              <Spinner /> Загрузка статуса шаблона…
+            </div>
+          ) : tpl?.exists ? (
+            <div className="flex flex-wrap items-center gap-2 text-sm text-zinc-300">
+              <span>Шаблон задан ({formatSizeKb(tpl.size ?? 0)})</span>
+              {(tpl.keys ?? []).map((k) => (
+                <span
+                  key={k}
+                  className="rounded-full border border-sky-500/40 bg-sky-500/10 px-2.5 py-0.5 text-xs font-medium text-sky-400"
+                >
+                  {k}
+                </span>
+              ))}
+              {!(tpl.keys ?? []).includes('ТЕКСТ') && (
+                <span className="text-xs text-amber-400">
+                  Нет ключа ТЕКСТ — содержимое ДИ не вставится в выгрузку
+                </span>
+              )}
+            </div>
+          ) : (
+            <p className="text-sm text-zinc-500">
+              Шаблон не задан — исправленные ДИ выгружаются как есть.
+            </p>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              type="file"
+              accept=".docx"
+              aria-label="Файл шаблона (.docx)"
+              onChange={(e) => {
+                setTplFile(e.target.files?.[0] ?? null)
+                e.target.value = ''
+              }}
+              className="text-sm text-zinc-400 file:mr-3 file:cursor-pointer file:rounded-lg file:border file:border-zinc-600 file:bg-zinc-800 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-zinc-100 file:transition-colors hover:file:bg-zinc-700"
+            />
+            <button
+              type="button"
+              onClick={() => void handleUploadTemplate()}
+              disabled={!tplFile || tplUploading || tplDeleting}
+              title={!tplFile ? 'Сначала выберите файл .docx' : undefined}
+              className={historyBtnPrimaryCls}
+            >
+              {tplUploading && <Spinner />}
+              {tplUploading ? 'Загружается…' : 'Загрузить'}
+            </button>
+            {tpl?.exists && (
+              <button
+                type="button"
+                onClick={() => void handleDeleteTemplate()}
+                disabled={tplDeleting || tplUploading}
+                className={historyBtnCls}
+              >
+                {tplDeleting && <Spinner />}
+                {tplDeleting ? 'Удаляется…' : 'Удалить шаблон'}
+              </button>
+            )}
+          </div>
+
+          <p className="text-xs text-zinc-500">
+            Доступные ключи подстановки: {'{{ДОЛЖНОСТЬ}}'}, {'{{ПОДРАЗДЕЛЕНИЕ}}'},{' '}
+            {'{{НАЗВАНИЕ}}'}, {'{{ТЕКСТ}}'} (содержимое исправленного ДИ), {'{{ДАТА}}'},{' '}
+            {'{{ЗАМЕТКИ}}'}.
+          </p>
+        </div>
+      )}
 
       {/* Загрузка / пустые состояния */}
       {loading && items.length === 0 && (

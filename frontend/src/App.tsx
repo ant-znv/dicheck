@@ -4,11 +4,12 @@ import SettingsPanel from './components/SettingsPanel'
 import CheckPanel, { type CheckContext } from './components/CheckPanel'
 import Results from './components/Results'
 import HistoryView from './components/HistoryView'
+import OverlapsView from './components/OverlapsView'
 import Toast, { type ToastData } from './components/Toast'
 
 const JOB_ID_KEY = 'di_check_job_id'
 
-type View = 'check' | 'history'
+type View = 'check' | 'history' | 'overlaps'
 
 function Spinner() {
   return (
@@ -188,7 +189,7 @@ export default function App() {
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 py-4">
         <h1 className="text-lg font-bold text-zinc-50">Проверка должностных инструкций</h1>
         <div className="flex items-center gap-3">
-          {/* Переключатель разделов: Проверка / История */}
+          {/* Переключатель разделов: Проверка / История / Пересечения */}
           <div
             role="tablist"
             aria-label="Разделы"
@@ -198,6 +199,7 @@ export default function App() {
               [
                 ['check', 'Проверка'],
                 ['history', 'История'],
+                ['overlaps', 'Пересечения'],
               ] as const
             ).map(([key, label]) => (
               <button
@@ -299,6 +301,8 @@ export default function App() {
         <main className="min-w-0 flex-1 space-y-6">
           {view === 'history' ? (
             <HistoryView onError={showError} onSuccess={showSuccess} />
+          ) : view === 'overlaps' ? (
+            <OverlapsView onError={showError} onSuccess={showSuccess} />
           ) : (
             <>
               <CheckPanel

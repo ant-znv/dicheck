@@ -155,6 +155,73 @@ export interface HistoryExtractResult {
   error: string | null
 }
 
+/** Результат извлечения обязанностей одного документа. */
+export interface HistoryDutiesResult {
+  documentId: number
+  count: number
+  duties: string[]
+}
+
+// --- Пересечения обязанностей ---
+
+/** Документ, вошедший в отчёт о пересечениях. */
+export interface OverlapDocument {
+  documentId: number
+  position: string
+  department: string
+  dutiesCount: number
+}
+
+/** Обязанность конкретного документа внутри группы пересечения. */
+export interface OverlapItem {
+  documentId: number
+  position: string
+  department: string
+  duty: string
+}
+
+/** Группа пересекающихся обязанностей. */
+export interface OverlapGroup {
+  duty: string
+  comment: string
+  items: OverlapItem[]
+}
+
+/** Документ, пропущенный при построении отчёта (нет текста, ошибка LLM и т.п.). */
+export interface OverlapSkipped {
+  documentId: number
+  position: string
+  department: string
+  error: string
+}
+
+/** Отчёт о пересечениях обязанностей (POST/GET /api/history/overlaps). */
+export interface OverlapReport {
+  id: number
+  createdAt: string
+  documents: OverlapDocument[]
+  groups: OverlapGroup[]
+  skipped: OverlapSkipped[]
+}
+
+// --- Шаблон экспорта ---
+
+/** Статус шаблона выгрузки (GET /api/history/template). */
+export interface HistoryTemplateInfo {
+  exists: boolean
+  /** Размер файла шаблона в байтах (когда задан). */
+  size?: number
+  /** Найденные в шаблоне плейсхолдеры, напр. ["ДОЛЖНОСТЬ","ТЕКСТ"]. */
+  keys?: string[]
+}
+
+/** Результат загрузки шаблона (PUT /api/history/template). */
+export interface HistoryTemplateUploadResult {
+  ok: boolean
+  size: number
+  keys: string[]
+}
+
 export class ApiError extends Error {
   status: number
   detail: string | null
@@ -340,8 +407,42 @@ export const api = {
       jsonInit('POST', { documentIds }),
     ),
 
-  exportHistoryFixed: (documentIds?: number[]) =>
-    requestBlob(
-      `/api/history/export/fixed${documentIds ? `?documentIds=${documentIds.join(',')}` : ''}`,
-    ),
+  extractDuties: (id: number) =>
+    request<HistoryDutiesResult>(`/api/history/documents/${id}/extract-duties`, {
+      method: 'POST',
+    }),
+
+  /**
+   * Запуск поиска пересечений обязанностей (долгая LLM-операция).
+   * null — сравнить все документы.
+   */
+  runOverlaps: (documentIds: number[] | null) =>
+    request<OverlapReport>('/api/history/overlaps', jsonInit('POST', { documentIds })),
+
+  /** Последний сохранённый отчёт о пересечениях (404 no_report, если ещё не запускался). */
+  getLatestOverlaps: () => request<OverlapReport>('/api/history/overlaps'),
+
+  /** Загрузка шаблона выгрузки: сырые байты .docx (application/octet-stream). */
+  uploadTemplate: (bytes: Blob) =>
+    request<HistoryTemplateUploadResult>('/api/history/template', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: bytes,
+    }),
+
+  getTemplate: () => request<HistoryTemplateInfo>('/api/history/template'),
+
+  deleteTemplate: () => request<{ ok: boolean }>('/api/history/template', { method: 'DELETE' }),
+
+  /**
+   * Выгрузка исправленных ДИ в ZIP. С options.template=true — по шаблону
+   * (409 no_template, если шаблон не задан).
+   */
+  exportHistoryFixed: (documentIds?: number[], options?: { template?: boolean }) => {
+    const q = new URLSearchParams()
+    if (documentIds) q.set('documentIds', documentIds.join(','))
+    if (options?.template) q.set('template', 'true')
+    const qs = q.toString()
+    return requestBlob(`/api/history/export/fixed${qs ? `?${qs}` : ''}`)
+  },
 }
