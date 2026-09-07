@@ -177,10 +177,12 @@ def save_api_key(provider: str, api_key: str) -> None:
 # ---------- Обновления (GitHub Releases) ----------
 
 def get_update_config() -> dict:
-    """Репозиторий ('owner/name' или '') и расшифрованный токен (или None)."""
+    """Репозиторий ('owner/name'; пусто = дефолт из updater) и расшифрованный токен."""
+    from . import updater  # лениво, чтобы избежать цикла импортов
+
     with _lock:
         cfg = _load()
-    repo = (cfg.get("updateRepo") or "").strip()
+    repo = (cfg.get("updateRepo") or "").strip() or updater.DEFAULT_REPO
     token: str | None = None
     enc = (cfg.get("updateToken") or "").strip()
     if enc:
