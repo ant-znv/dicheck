@@ -67,9 +67,23 @@ def test_check_update_available():
     assert info["updateAvailable"] is True
 
 
-def test_check_repo_not_set():
-    info = check("", None, fetch_json=lambda *a: (_ for _ in ()).throw(AssertionError("no call")))
+def test_check_repo_not_set(monkeypatch):
+    monkeypatch.setattr(updater, "DEFAULT_REPO", "")
+    info = check(None, None, fetch_json=lambda *a: (_ for _ in ()).throw(AssertionError("no call")))
     assert info["error"] is not None and "не задан" in info["error"]
+
+
+def test_check_empty_repo_falls_back_to_default(monkeypatch):
+    monkeypatch.setattr(updater, "DEFAULT_REPO", "def/repo")
+    seen = {}
+
+    def fake_fetch(url, token):
+        seen["url"] = url
+        return {"tag_name": "v0.1.0", "assets": []}
+
+    info = check("", None, fetch_json=fake_fetch)
+    assert seen["url"] == f"{updater.GITHUB_API}/repos/def/repo/releases/latest"
+    assert info["error"] is None
 
 
 def test_check_404_is_not_a_crash():
