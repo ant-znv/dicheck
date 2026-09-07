@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import socket
 import sys
 import threading
 import time
 import webbrowser
+from pathlib import Path
 
 from backend.app.logsetup import build_uvicorn_log_config, setup_logging
 
@@ -30,6 +32,12 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 WINDOW_TITLE = "DI_Check"
 log = logging.getLogger("di_check.run")
+
+# GUID EdgeUpdate-клиента WebView2 Runtime
+_WEBVIEW2_KEYS = (
+    (r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",),
+    (r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",),
+)
 
 
 def _port_busy(host: str, port: int) -> bool:
@@ -55,13 +63,59 @@ def _redirect_std_streams(log_file) -> None:
         sys.stderr = open(log_file.with_suffix(".stderr.log"), "a", encoding="utf-8")
 
 
+def _webview2_runtime_ok() -> bool:
+    """Установлен ли WebView2 Runtime? На машинах без него pywebview иногда
+    даёт белое окно вместо ошибки — проверяем реестр заранее."""
+    try:
+        import winreg
+
+        for paths in _WEBVIEW2_KEYS:
+            for path in paths:
+                try:
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+                        version = winreg.QueryValueEx(key, "pv")[0]
+                        if version and version != "0.0.0.0":
+                            return True
+                except OSError:
+                    continue
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+            ) as key:
+                version = winreg.QueryValueEx(key, "pv")[0]
+                if version and version != "0.0.0.0":
+                    return True
+        except OSError:
+            pass
+        return False
+    except Exception:
+        return True  # не смогли проверить реестр — пусть pywebview пробует сам
+
+
 def _open_window(url: str) -> bool:
     """Окно WebView2; блокирует до закрытия окна. False — GUI недоступен."""
+    if not _webview2_runtime_ok():
+        log.warning(
+            "WebView2 Runtime не найден — окно недоступно. Установите "
+            "https://developer.microsoft.com/microsoft-edge/webview2/ или используйте браузер"
+        )
+        return False
     try:
         import webview
 
-        webview.create_window(WINDOW_TITLE, url, width=1280, height=860, min_size=(900, 600))
-        webview.start(gui="edgechromium")
+        # Хранилище WebView2 — в %APPDATA%: рядом с exe оно не всегда доступно
+        # на запись, и это известная причина «белого окна».
+        storage = Path(os.environ.get("APPDATA") or Path.home()) / "DI_Check" / "webview"
+        storage.mkdir(parents=True, exist_ok=True)
+        os.environ["WEBVIEW2_USER_DATA_FOLDER"] = str(storage)
+
+        window = webview.create_window(
+            WINDOW_TITLE, url, width=1280, height=860, min_size=(900, 600)
+        )
+        window.events.loaded += lambda: log.info("Окно загрузило страницу %s", url)
+        # private_mode=False: ин-memory профиль на некоторых машинах тоже даёт белое окно
+        webview.start(gui="edgechromium", private_mode=False, storage_path=str(storage))
         return True
     except Exception as e:
         log.warning("Оконный движок недоступен (%s) — открываю в браузере", e)
@@ -117,7 +171,9 @@ def main() -> None:
         log.info("Окно закрыто — останавливаю приложение")
         return  # daemon-поток сервера завершится вместе с процессом
 
-    # окна нет (нет WebView2 и браузера) — работаем в консоли до Ctrl+C
+    # окна нет (WebView2/браузер недоступны) — работаем в консоли до Ctrl+C
+    log.info("Открываю браузер как резервный вариант интерфейса")
+    webbrowser.open(url)
     log.info("Работаю в фоне; остановка — Ctrl+C")
     server_thread.join()
 
