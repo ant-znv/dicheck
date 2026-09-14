@@ -296,6 +296,8 @@ export interface DownloadedFile {
   blob: Blob
   /** Имя файла из Content-Disposition, если сервер его прислал. */
   filename: string | null
+  /** Заголовки ответа (например, X-Fix-Results у fix-all). */
+  headers: Headers
 }
 
 async function requestBlob(path: string, init?: RequestInit): Promise<DownloadedFile> {
@@ -310,7 +312,11 @@ async function requestBlob(path: string, init?: RequestInit): Promise<Downloaded
     throw new ApiError(res.status, detail, `Ошибка сервера (${res.status})`)
   }
   const blob = await res.blob()
-  return { blob, filename: filenameFromDisposition(res.headers.get('Content-Disposition')) }
+  return {
+    blob,
+    filename: filenameFromDisposition(res.headers.get('Content-Disposition')),
+    headers: res.headers,
+  }
 }
 
 function jsonInit(method: string, body: unknown): RequestInit {
@@ -318,6 +324,40 @@ function jsonInit(method: string, body: unknown): RequestInit {
     method,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+  }
+}
+
+/** Результат исправления одного файла в /fix-all (из заголовка X-Fix-Results). */
+export interface FixAllOutcome {
+  filename: string
+  ok: boolean
+  error: string | null
+  method: string | null
+}
+
+export interface FixAllDownload extends DownloadedFile {
+  /** Сводка по каждому файлу; null — старый бэкенд без заголовка. */
+  outcomes: FixAllOutcome[] | null
+}
+
+/** base64-UTF8 JSON из X-Fix-Results; мусор/отсутствие → null. */
+function fixResultsFromHeader(header: string | null): FixAllOutcome[] | null {
+  if (!header) return null
+  try {
+    const bytes = Uint8Array.from(atob(header), (c) => c.charCodeAt(0))
+    const data = JSON.parse(new TextDecoder().decode(bytes)) as { items?: unknown }
+    if (!Array.isArray(data.items)) return null
+    return data.items.map((raw) => {
+      const item = (raw ?? {}) as Record<string, unknown>
+      return {
+        filename: typeof item.filename === 'string' ? item.filename : '',
+        ok: item.ok === true,
+        error: typeof item.error === 'string' ? item.error : null,
+        method: typeof item.method === 'string' ? item.method : null,
+      }
+    })
+  } catch {
+    return null
   }
 }
 
@@ -365,8 +405,10 @@ export const api = {
   fixDocument: (jobId: string, resultIndex: number, editIds: string[]) =>
     requestBlob(`/api/jobs/${jobId}/fix`, jsonInit('POST', { resultIndex, editIds })),
 
-  fixAll: (jobId: string, items: FixAllItem[]) =>
-    requestBlob(`/api/jobs/${jobId}/fix-all`, jsonInit('POST', { items })),
+  fixAll: async (jobId: string, items: FixAllItem[]): Promise<FixAllDownload> => {
+    const file = await requestBlob(`/api/jobs/${jobId}/fix-all`, jsonInit('POST', { items }))
+    return { ...file, outcomes: fixResultsFromHeader(file.headers.get('X-Fix-Results')) }
+  },
 
   exportBlob: (jobId: string, format: 'md' | 'html' | 'docx') =>
     requestBlob(`/api/jobs/${jobId}/export?format=${format}`),

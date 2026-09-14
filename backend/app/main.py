@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import html as html_mod
 import io
@@ -1087,8 +1088,8 @@ class FixAllRequest(BaseModel):
 
 async def _fix_one(
     sem: asyncio.Semaphore, job: dict, item: FixAllItem
-) -> tuple[str, bytes | None, str | None]:
-    """Исправляет один файл. Возвращает (имя файла в архиве, docx | None, ошибка | None)."""
+) -> tuple[str, bytes | None, str | None, str | None]:
+    """Исправляет один файл. Возвращает (имя в архиве, docx | None, ошибка | None, метод)."""
     result = job["results"][item.resultIndex]
     arcname = f"{Path(result['filename']).stem}_исправленная.docx"
     async with sem:
@@ -1098,7 +1099,7 @@ async def _fix_one(
             logger.warning(
                 "Fix-all %s[%d]: не удалось: %s", job["id"], item.resultIndex, e
             )
-            return arcname, None, str(e)
+            return arcname, None, str(e), None
     logger.info(
         "Fix-all %s[%d]: применено методом %s", job["id"], item.resultIndex, method
     )
@@ -1110,7 +1111,7 @@ async def _fix_one(
             history.save_fixed_version(parent, docx_bytes, method, item.editIds, arcname)
         except Exception as e:
             logger.warning("History save failed: %s", e)
-    return arcname, docx_bytes, None
+    return arcname, docx_bytes, None, method
 
 
 @app.post("/api/jobs/{job_id}/fix-all")
@@ -1131,13 +1132,21 @@ async def fix_all_documents(job_id: str, body: FixAllRequest):
 
     successes: list[tuple[str, bytes]] = []
     failures: list[str] = []
-    for result_index, (arcname, docx_bytes, error) in zip(
-        (i.resultIndex for i in body.items), outcomes
-    ):
+    summary: list[dict] = []
+    for item, (arcname, docx_bytes, error, method) in zip(body.items, outcomes):
+        filename = job["results"][item.resultIndex]["filename"]
+        summary.append(
+            {
+                "filename": filename,
+                "ok": docx_bytes is not None,
+                "error": (error or "")[:200] or None,
+                "method": method,
+            }
+        )
         if docx_bytes is not None:
             successes.append((arcname, docx_bytes))
         else:
-            failures.append(f"{job['results'][result_index]['filename']}: {error}")
+            failures.append(f"{filename}: {error}")
 
     if not successes:
         raise HTTPException(status_code=502, detail="no_files_fixed")
@@ -1156,10 +1165,18 @@ async def fix_all_documents(job_id: str, body: FixAllRequest):
             zf.writestr(name, docx_bytes)
         if failures:
             zf.writestr("_errors.txt", "\n".join(failures) + "\n")
+    # сводка результатов наружу — base64-JSON в заголовке (ASCII-безопасно):
+    # UI показывает успехи/ошибки без заглядывания в _errors.txt внутри архива
+    results_b64 = base64.b64encode(
+        json.dumps({"items": summary}, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
     return Response(
         content=buf.getvalue(),
         media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="ispravlennye_di.zip"'},
+        headers={
+            "Content-Disposition": 'attachment; filename="ispravlennye_di.zip"',
+            "X-Fix-Results": results_b64,
+        },
     )
 
 

@@ -1,9 +1,26 @@
 import { useEffect, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { api, formatError, type Edit, type Job, type JobResult, type Verdict } from '../api'
+import {
+  api,
+  formatError,
+  type Edit,
+  type FixAllOutcome,
+  type Job,
+  type JobResult,
+  type Verdict,
+} from '../api'
 
 type ExportFormat = 'md' | 'html' | 'docx'
+
+/** Русская форма слова «файл»: 1 файл, 2 файла, 5 файлов. */
+function filesLabel(n: number): string {
+  const m10 = n % 10
+  const m100 = n % 100
+  if (m10 === 1 && m100 !== 11) return 'файл'
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return 'файла'
+  return 'файлов'
+}
 
 /** Скачивание blob как файла (создаём временную ссылку и сразу освобождаем). */
 function downloadBlob(blob: Blob, filename: string) {
@@ -197,7 +214,10 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
   // Отсутствующая запись = выбраны все правки файла (значение по умолчанию).
   const [selection, setSelection] = useState<Record<number, ReadonlySet<string>>>({})
   const [fixingAll, setFixingAll] = useState(false)
-  const [fixAllSummary, setFixAllSummary] = useState<string | null>(null)
+  const [fixAllReport, setFixAllReport] = useState<{
+    total: number
+    outcomes: FixAllOutcome[] | null
+  } | null>(null)
   const [cancelling, setCancelling] = useState(false)
   const [exporting, setExporting] = useState<ExportFormat | null>(null)
 
@@ -265,14 +285,13 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
 
   const handleFixAll = async () => {
     setFixingAll(true)
-    setFixAllSummary(null)
+    setFixAllReport(null)
     try {
-      const { blob, filename } = await api.fixAll(job.id, fixAllItems)
+      const { blob, filename, outcomes } = await api.fixAll(job.id, fixAllItems)
       downloadBlob(blob, filename ?? 'ispravlennye_di.zip')
-      setFixAllSummary(
-        `Отправлено на исправление: ${fixAllItems.length} файл(ов). ` +
-          'Если какие-то файлы не удалось исправить, причины перечислены в _errors.txt внутри архива.',
-      )
+      // бэкенд кладёт сводку по каждому файлу в заголовок X-Fix-Results;
+      // без неё (старый сервер) показываем нейтральный вариант
+      setFixAllReport({ total: outcomes?.length ?? fixAllItems.length, outcomes })
     } catch (e) {
       onError(formatError(e, 'Не удалось выполнить пакетное исправление'))
     } finally {
@@ -360,7 +379,38 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
               занять несколько минут. Не закрывайте страницу.
             </p>
           )}
-          {fixAllSummary && <p className="mt-3 text-xs text-emerald-400">{fixAllSummary}</p>}
+          {fixAllReport &&
+            (fixAllReport.outcomes ? (
+              (() => {
+                const failures = fixAllReport.outcomes.filter((o) => !o.ok)
+                const okCount = fixAllReport.total - failures.length
+                return (
+                  <div className="mt-3 space-y-2 text-xs">
+                    <p className={failures.length ? 'text-amber-400' : 'text-emerald-400'}>
+                      Исправлено {okCount} из {fixAllReport.total}{' '}
+                      {filesLabel(fixAllReport.total)}.
+                      {failures.length > 0 &&
+                        ' Причины — в списке ниже, они же в _errors.txt внутри архива.'}
+                    </p>
+                    {failures.length > 0 && (
+                      <ul className="space-y-1 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                        {failures.map((o, i) => (
+                          <li key={i} className="text-amber-300">
+                            <span className="font-medium">{o.filename}</span>
+                            {o.error ? ` — ${o.error}` : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )
+              })()
+            ) : (
+              <p className="mt-3 text-xs text-emerald-400">
+                Архив скачан ({fixAllReport.total} {filesLabel(fixAllReport.total)}). Причины
+                неудач, если были, — в _errors.txt внутри архива.
+              </p>
+            ))}
         </div>
       )}
 

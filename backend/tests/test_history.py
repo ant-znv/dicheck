@@ -3,6 +3,7 @@
 в tmp_path (изоляция через conftest.isolated_settings)."""
 from __future__ import annotations
 
+import base64
 import io
 import json
 import sqlite3
@@ -254,6 +255,12 @@ def test_fix_all_creates_fix_version(client, with_api_key, make_fake_llm, make_d
     )
     assert fix_all.status_code == 200
 
+    # сводка по каждому файлу — в заголовке X-Fix-Results (base64-JSON)
+    header = json.loads(base64.b64decode(fix_all.headers["X-Fix-Results"]))
+    assert header["items"] == [
+        {"filename": "di.docx", "ok": True, "error": None, "method": "docx"}
+    ]
+
     fixed = [
         v
         for v in client.get(f"/api/history/documents/{doc_id}").json()["versions"]
@@ -262,6 +269,58 @@ def test_fix_all_creates_fix_version(client, with_api_key, make_fake_llm, make_d
     assert len(fixed) == 1
     assert fixed[0]["fixMethod"] == "docx"
     assert fixed[0]["parentVersionId"] == check_vid
+
+
+def test_fix_all_header_reports_failures(
+    client, with_api_key, make_fake_llm, make_docx_bytes, monkeypatch
+):
+    """Один файл исправлен, второй упал: сводка в X-Fix-Results и _errors.txt."""
+    make_fake_llm([structured_response(verdict="fail")])
+    resp = client.post(
+        "/api/check",
+        files=[
+            ("files", ("good.docx", make_docx_bytes(BODY), DOCX_MIME)),
+            (
+                "files",
+                ("bad.docx", make_docx_bytes(["Должностная инструкция", "Обходить территорию."]), DOCX_MIME),
+            ),
+        ],
+        data={"contractSubject": "", "employmentType": "", "extraContext": ""},
+    )
+    assert resp.status_code == 200
+    job_id = resp.json()["jobId"]
+    poll_done(client, job_id)
+
+    # у bad.docx цитаты из правки в тексте нет — сработает LLM-фолбэк,
+    # который мы ломаем, чтобы получить отказ по одному файлу
+    async def broken_chat(*args, **kwargs):
+        raise main.llm.LLMError("модель недоступна")
+
+    monkeypatch.setattr(main.llm, "chat_completion", broken_chat)
+
+    fix_all = client.post(
+        f"/api/jobs/{job_id}/fix-all",
+        json={
+            "items": [
+                {"resultIndex": 0, "editIds": ["e1"]},
+                {"resultIndex": 1, "editIds": ["e1"]},
+            ]
+        },
+    )
+    assert fix_all.status_code == 200
+
+    items = json.loads(base64.b64decode(fix_all.headers["X-Fix-Results"]))["items"]
+    assert [i["ok"] for i in items] == [True, False]
+    assert items[0]["method"] == "docx"
+    assert items[0]["filename"] == "good.docx"
+    assert "модель недоступна" in items[1]["error"]
+
+    with zipfile.ZipFile(io.BytesIO(fix_all.content)) as zf:
+        names = zf.namelist()
+        assert "good_исправленная.docx" in names
+        assert "bad_исправленная.docx" not in names
+        assert "_errors.txt" in names
+        assert "модель недоступна" in zf.read("_errors.txt").decode("utf-8")
 
 
 # ---------- PATCH / поиск / DELETE ----------
