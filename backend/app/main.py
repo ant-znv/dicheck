@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -114,6 +115,7 @@ class SettingsUpdate(BaseModel):
     activeModel: str | None = None
     systemPrompt: str | None = None
     updateRepo: str | None = None
+    saveDir: str | None = None
 
 
 class ApiKeyUpdate(BaseModel):
@@ -164,6 +166,7 @@ async def put_settings(body: SettingsUpdate):
             active_provider=body.activeProvider,
             active_model=body.activeModel,
             system_prompt=body.systemPrompt,
+            save_dir=body.saveDir,
         )
         if body.updateRepo is not None:
             settings.save_update_repo(body.updateRepo)
@@ -1075,6 +1078,68 @@ async def fix_document(job_id: str, body: FixRequest):
     )
 
 
+# ---------- Сохранение артефактов в папку пользователя ----------
+
+class SystemPathRequest(BaseModel):
+    path: str
+
+
+def _save_dir() -> Path:
+    return Path(settings.get_settings_state()["saveDir"])
+
+
+def _save_artifact(data: bytes, base_name: str) -> Path:
+    """Кладёт файл в папку saveDir с суффиксом-датой; коллизии — _2, _3..."""
+    dir_path = _save_dir()
+    dir_path.mkdir(parents=True, exist_ok=True)
+    stem = Path(base_name).stem or "artifact"
+    suffix = Path(base_name).suffix or ".zip"
+    name = f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{suffix}"
+    dest = dir_path / name
+    n = 2
+    while dest.exists():
+        dest = dir_path / f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{n}{suffix}"
+        n += 1
+    dest.write_bytes(data)
+    return dest
+
+
+def _validate_artifact_path(path: str) -> Path:
+    """Разрешает только пути внутри saveDir — защита от чтения/открытия произвольных файлов."""
+    candidate = Path(path).resolve()
+    try:
+        candidate.relative_to(_save_dir().resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_path")
+    return candidate
+
+
+@app.post("/api/system/reveal")
+async def system_reveal(body: SystemPathRequest):
+    """Показать файл в Проводнике (папка открывается с выделенным файлом)."""
+    target = _validate_artifact_path(body.path)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="artifact_not_found")
+    subprocess.Popen(["explorer", f"/select,{target}"])
+    return {"ok": True}
+
+
+@app.get("/api/system/artifact")
+async def system_artifact(path: str):
+    """Отдать сохранённый артефакт на скачивание (только из saveDir)."""
+    target = _validate_artifact_path(path)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="artifact_not_found")
+    filename = target.name
+    return Response(
+        content=target.read_bytes(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"
+        },
+    )
+
+
 # ---------- Пакетное исправление (/fix-all) ----------
 
 class FixAllItem(BaseModel):
@@ -1115,7 +1180,7 @@ async def _fix_one(
 
 
 @app.post("/api/jobs/{job_id}/fix-all")
-async def fix_all_documents(job_id: str, body: FixAllRequest):
+async def fix_all_documents(job_id: str, body: FixAllRequest, save: bool = False):
     job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job_not_found")
@@ -1170,6 +1235,22 @@ async def fix_all_documents(job_id: str, body: FixAllRequest):
     results_b64 = base64.b64encode(
         json.dumps({"items": summary}, ensure_ascii=False).encode("utf-8")
     ).decode("ascii")
+
+    if save:
+        # окно pywebview может не поддерживать blob-скачивания — сохраняем сами
+        # в известную папку и возвращаем путь (UI покажет его + «Открыть папку»)
+        try:
+            dest = await asyncio.to_thread(
+                _save_artifact, buf.getvalue(), "ispravlennye_di.zip"
+            )
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"save_failed: {e}")
+        return {
+            "path": str(dest),
+            "filename": dest.name,
+            "results": {"items": summary},
+        }
+
     return Response(
         content=buf.getvalue(),
         media_type="application/zip",

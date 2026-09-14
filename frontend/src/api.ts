@@ -340,6 +340,13 @@ export interface FixAllDownload extends DownloadedFile {
   outcomes: FixAllOutcome[] | null
 }
 
+/** Ответ /fix-all?save=true — архив сохранён бэкендом на диск. */
+export interface FixAllSaved {
+  path: string
+  filename: string
+  results: { items: FixAllOutcome[] }
+}
+
 /** base64-UTF8 JSON из X-Fix-Results; мусор/отсутствие → null. */
 function fixResultsFromHeader(header: string | null): FixAllOutcome[] | null {
   if (!header) return null
@@ -408,6 +415,25 @@ export const api = {
   fixAll: async (jobId: string, items: FixAllItem[]): Promise<FixAllDownload> => {
     const file = await requestBlob(`/api/jobs/${jobId}/fix-all`, jsonInit('POST', { items }))
     return { ...file, outcomes: fixResultsFromHeader(file.headers.get('X-Fix-Results')) }
+  },
+
+  /** Архив сохраняется бэкендом в папку загрузок; ответ — путь на диске. */
+  fixAllToDisk: async (jobId: string, items: FixAllItem[]): Promise<FixAllSaved> => {
+    const data = await request<FixAllSaved>(
+      `/api/jobs/${jobId}/fix-all?save=true`,
+      jsonInit('POST', { items }),
+    )
+    return data
+  },
+
+  /** Показать сохранённый файл в Проводнике (только внутри папки загрузок). */
+  revealPath: (path: string) =>
+    request<{ ok: boolean }>('/api/system/reveal', jsonInit('POST', { path })),
+
+  /** Скачать копию уже сохранённого артефакта. */
+  artifactBlob: (path: string) => {
+    const q = new URLSearchParams({ path })
+    return requestBlob(`/api/system/artifact?${q.toString()}`)
   },
 
   exportBlob: (jobId: string, format: 'md' | 'html' | 'docx') =>

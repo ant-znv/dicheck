@@ -179,6 +179,9 @@ def _open_window(url: str) -> bool:
             WINDOW_TITLE, url, width=1280, height=860, min_size=(900, 600)
         )
         window.events.loaded += lambda: log.info("Окно загрузило страницу %s", url)
+        # скачивания в окне по умолчанию pywebview отменяет молча — включаем:
+        # каждый blob-ответ покажет нативный диалог «Сохранить как»
+        webview.settings["ALLOW_DOWNLOADS"] = True
         # private_mode=False: ин-memory профиль на некоторых машинах тоже даёт белое окно
         webview.start(gui="edgechromium", private_mode=False, storage_path=str(storage))
         return True

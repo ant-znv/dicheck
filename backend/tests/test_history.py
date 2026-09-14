@@ -9,11 +9,12 @@ import json
 import sqlite3
 import time
 import zipfile
+from pathlib import Path
 
 import pytest
 from docx import Document
 
-from backend.app import history, main
+from backend.app import history, main, settings
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 QUOTE = "дежурить в ночное время суток"
@@ -321,6 +322,64 @@ def test_fix_all_header_reports_failures(
         assert "bad_исправленная.docx" not in names
         assert "_errors.txt" in names
         assert "модель недоступна" in zf.read("_errors.txt").decode("utf-8")
+
+
+# ---------- Сохранение архива на диск (fix-all?save) ----------
+
+def test_fix_all_save_to_disk(
+    client, with_api_key, make_fake_llm, make_docx_bytes, tmp_path, monkeypatch
+):
+    """save=true: бэкенд сам кладёт архив в saveDir и возвращает путь."""
+    save_dir = tmp_path / "downloads" / "DI_Check"
+    settings.update_settings(save_dir=str(save_dir))
+
+    job_id, _ = run_check(client, make_fake_llm, make_docx_bytes)
+    saved = client.post(
+        f"/api/jobs/{job_id}/fix-all?save=true",
+        json={"items": [{"resultIndex": 0, "editIds": ["e1"]}]},
+    )
+    assert saved.status_code == 200
+    data = saved.json()
+    assert data["filename"].startswith("ispravlennye_di_") and data["filename"].endswith(".zip")
+    path = Path(data["path"])
+    assert path.parent.resolve() == save_dir.resolve()
+    assert path.read_bytes()[:2] == b"PK"
+    assert data["results"]["items"][0]["ok"] is True
+
+    # артефакт отдаётся на скачивание только изнутри saveDir
+    got = client.get("/api/system/artifact", params={"path": data["path"]})
+    assert got.status_code == 200
+    assert got.content[:2] == b"PK"
+    outside = client.get("/api/system/artifact", params={"path": str(tmp_path / "x.zip")})
+    assert outside.status_code == 400
+    assert outside.json()["detail"] == "invalid_path"
+
+    # reveal: чужой путь отклоняется, свой — ok (explorer мокается)
+    reveal_outside = client.post(
+        "/api/system/reveal", json={"path": str(tmp_path / "x.zip")}
+    )
+    assert reveal_outside.status_code == 400
+
+    recorded: list = []
+
+    def fake_popen(args, **kwargs):
+        recorded.append(args)
+        return None
+
+    monkeypatch.setattr(main.subprocess, "Popen", fake_popen)
+    reveal = client.post("/api/system/reveal", json={"path": data["path"]})
+    assert reveal.status_code == 200
+    assert reveal.json()["ok"] is True
+    assert recorded and "explorer" in recorded[0][0]
+
+
+def test_settings_savedir_roundtrip(client, tmp_path):
+    put = client.put("/api/settings", json={"saveDir": str(tmp_path / "мой каталог")})
+    assert put.status_code == 200
+    assert put.json()["saveDir"] == str(tmp_path / "мой каталог")
+    empty = client.put("/api/settings", json={"saveDir": ""})
+    assert empty.status_code == 200
+    assert "Downloads" in empty.json()["saveDir"]
 
 
 # ---------- PATCH / поиск / DELETE ----------

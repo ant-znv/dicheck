@@ -216,7 +216,9 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
   const [fixingAll, setFixingAll] = useState(false)
   const [fixAllReport, setFixAllReport] = useState<{
     total: number
-    outcomes: FixAllOutcome[] | null
+    outcomes: FixAllOutcome[]
+    savedPath: string | null
+    revealing: boolean
   } | null>(null)
   const [cancelling, setCancelling] = useState(false)
   const [exporting, setExporting] = useState<ExportFormat | null>(null)
@@ -287,15 +289,41 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
     setFixingAll(true)
     setFixAllReport(null)
     try {
-      const { blob, filename, outcomes } = await api.fixAll(job.id, fixAllItems)
-      downloadBlob(blob, filename ?? 'ispravlennye_di.zip')
-      // бэкенд кладёт сводку по каждому файлу в заголовок X-Fix-Results;
-      // без неё (старый сервер) показываем нейтральный вариант
-      setFixAllReport({ total: outcomes?.length ?? fixAllItems.length, outcomes })
+      // архив сохраняется бэкендом в папку загрузок — окно pywebview не
+      // полагается на браузерные скачивания, путь показываем в панели ниже
+      const saved = await api.fixAllToDisk(job.id, fixAllItems)
+      setFixAllReport({
+        total: saved.results.items.length,
+        outcomes: saved.results.items,
+        savedPath: saved.path,
+        revealing: false,
+      })
     } catch (e) {
       onError(formatError(e, 'Не удалось выполнить пакетное исправление'))
     } finally {
       setFixingAll(false)
+    }
+  }
+
+  const openSavedArchive = async () => {
+    if (!fixAllReport?.savedPath) return
+    setFixAllReport({ ...fixAllReport, revealing: true })
+    try {
+      await api.revealPath(fixAllReport.savedPath)
+    } catch (e) {
+      onError(formatError(e, 'Не удалось открыть папку'))
+    } finally {
+      setFixAllReport((prev) => (prev ? { ...prev, revealing: false } : prev))
+    }
+  }
+
+  const downloadSavedArchive = async () => {
+    if (!fixAllReport?.savedPath) return
+    try {
+      const { blob, filename } = await api.artifactBlob(fixAllReport.savedPath)
+      downloadBlob(blob, filename ?? 'ispravlennye_di.zip')
+    } catch (e) {
+      onError(formatError(e, 'Не удалось скачать копию архива'))
     }
   }
 
@@ -380,37 +408,50 @@ export default function Results({ job, onError }: { job: Job; onError: (msg: str
             </p>
           )}
           {fixAllReport &&
-            (fixAllReport.outcomes ? (
-              (() => {
-                const failures = fixAllReport.outcomes.filter((o) => !o.ok)
-                const okCount = fixAllReport.total - failures.length
-                return (
-                  <div className="mt-3 space-y-2 text-xs">
-                    <p className={failures.length ? 'text-amber-400' : 'text-emerald-400'}>
-                      Исправлено {okCount} из {fixAllReport.total}{' '}
-                      {filesLabel(fixAllReport.total)}.
-                      {failures.length > 0 &&
-                        ' Причины — в списке ниже, они же в _errors.txt внутри архива.'}
-                    </p>
-                    {failures.length > 0 && (
-                      <ul className="space-y-1 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-                        {failures.map((o, i) => (
-                          <li key={i} className="text-amber-300">
-                            <span className="font-medium">{o.filename}</span>
-                            {o.error ? ` — ${o.error}` : ''}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                )
-              })()
-            ) : (
-              <p className="mt-3 text-xs text-emerald-400">
-                Архив скачан ({fixAllReport.total} {filesLabel(fixAllReport.total)}). Причины
-                неудач, если были, — в _errors.txt внутри архива.
-              </p>
-            ))}
+            (() => {
+              const failures = fixAllReport.outcomes.filter((o) => !o.ok)
+              const okCount = fixAllReport.total - failures.length
+              return (
+                <div className="mt-3 space-y-2 text-xs">
+                  <p className={failures.length ? 'text-amber-400' : 'text-emerald-400'}>
+                    Исправлено {okCount} из {fixAllReport.total}{' '}
+                    {filesLabel(fixAllReport.total)}.
+                    {failures.length > 0 &&
+                      ' Причины — в списке ниже, они же в _errors.txt внутри архива.'}
+                  </p>
+                  {fixAllReport.savedPath && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <code className="max-w-full truncate rounded bg-zinc-900 px-2 py-1 text-zinc-300">
+                        {fixAllReport.savedPath}
+                      </code>
+                      <button
+                        onClick={() => void openSavedArchive()}
+                        disabled={fixAllReport.revealing}
+                        className="rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+                      >
+                        Открыть папку
+                      </button>
+                      <button
+                        onClick={() => void downloadSavedArchive()}
+                        className="rounded-lg border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800"
+                      >
+                        Скачать копию
+                      </button>
+                    </div>
+                  )}
+                  {failures.length > 0 && (
+                    <ul className="space-y-1 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                      {failures.map((o, i) => (
+                        <li key={i} className="text-amber-300">
+                          <span className="font-medium">{o.filename}</span>
+                          {o.error ? ` — ${o.error}` : ''}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )
+            })()}
         </div>
       )}
 

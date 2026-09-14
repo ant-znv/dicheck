@@ -114,6 +114,8 @@ def get_settings_state() -> dict:
         "activeProvider": cfg.get("activeProvider", "deepseek"),
         "activeModel": cfg.get("activeModel", "deepseek-v4-flash"),
         "systemPrompt": cfg.get("systemPrompt") or default_system_prompt(),
+        "saveDir": cfg.get("saveDir")
+        or str((Path.home() / "Downloads" / "DI_Check")),
     }
 
 
@@ -121,6 +123,7 @@ def update_settings(
     active_provider: str | None = None,
     active_model: str | None = None,
     system_prompt: str | None = None,
+    save_dir: str | None = None,
 ) -> None:
     with _lock:
         cfg = _load()
@@ -132,6 +135,12 @@ def update_settings(
             cfg["activeModel"] = active_model
         if system_prompt is not None:
             cfg["systemPrompt"] = system_prompt
+        if save_dir is not None:
+            save_dir = save_dir.strip()
+            if not save_dir:
+                cfg.pop("saveDir", None)  # пустая строка — вернуть дефолт
+            else:
+                cfg["saveDir"] = save_dir
         _save(cfg)
 
 
@@ -225,6 +234,7 @@ def build_settings_response() -> dict:
         "activeModel": state["activeModel"],
         "systemPrompt": state["systemPrompt"],
         "defaultSystemPrompt": default_system_prompt(),
+        "saveDir": state["saveDir"],
         "version": APP_VERSION,
         "update": {"repo": update_cfg["repo"], "hasToken": bool(update_cfg["token"])},
     }
