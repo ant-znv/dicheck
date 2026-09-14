@@ -4,4 +4,4 @@
 CI соберёт установщик с /DMyAppVersion=X.Y.Z и опубликует GitHub Release.
 """
 
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
